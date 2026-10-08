@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>palog 日志审计控制台</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230ea5b7'/><circle cx='8' cy='8' r='3.4' fill='%23d7dde8'/></svg>">
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="dot"></span><b>palog</b><small>Panabit 日志审计</small></div>
+  <nav class="tabs">
+    <button data-view="dash" class="active">仪表盘</button>
+    <button data-view="logs">日志查询</button>
+    <button data-view="sys">系统管理</button>
+  </nav>
+  <div class="header-right">
+    <span class="live" id="live-dot">实时</span>
+    <span id="live-stats" class="mono" title="包数 / 记录数 / 解析错误">-</span>
+  </div>
+</header>
+
+<main>
+  <!-- ======================= 仪表盘 ======================= -->
+  <section class="view active" id="view-dash">
+    <h2>仪表盘</h2>
+    <div class="grid g-stats" id="stat-cards">
+      <div class="card stat"><div class="lbl">日志总数</div><div class="num" id="s-total">-</div></div>
+      <div class="card stat"><div class="lbl">最近 1 小时</div><div class="num" id="s-hour">-</div></div>
+      <div class="card stat"><div class="lbl">接收速率</div><div class="num" id="s-pps">-</div></div>
+      <div class="card stat"><div class="lbl">UDP 包 / 记录</div><div class="num" id="s-pkts">-</div></div>
+      <div class="card stat"><div class="lbl">解析错误</div><div class="num" id="s-errs">-</div></div>
+    </div>
+    <div class="grid g-3" style="margin-top:14px;">
+      <div class="card">
+        <h3>日志类型分布</h3>
+        <div id="s-kinds"></div>
+      </div>
+      <div class="card">
+        <h3>Top 域名</h3>
+        <div id="s-domains"></div>
+      </div>
+      <div class="card">
+        <h3>Top 源 IP</h3>
+        <div id="s-srcip"></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px;">
+      <h3>最近 24 小时趋势</h3>
+      <div id="s-hourly"></div>
+    </div>
+    <div class="card" style="margin-top:14px;">
+      <h3>最近记录</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr>
+          <th>时间</th><th>类型</th><th>源</th><th>目的</th>
+          <th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>字节</th>
+        </tr></thead>
+        <tbody id="s-recent"></tbody>
+      </table></div>
+      <div id="s-recent-empty" class="empty" style="display:none;">暂无数据 — 等待 Panabit 日志到达…</div>
+    </div>
+  </section>
+
+  <!-- ======================= 日志查询 ======================= -->
+  <section class="view" id="view-logs">
+    <h2>日志查询</h2>
+    <div class="toolbar">
+      <select id="f-kind" title="类型">
+        <option value="">全部类型</option>
+        <option value="dnsquery">DNS 查询</option>
+        <option value="http">HTTP 会话</option>
+        <option value="session">协议会话(二进制)</option>
+      </select>
+      <input class="grow" id="f-q" placeholder="全文搜索: IP / 域名 / Host / 路径 / 用户…" title="关键词">
+      <input id="f-src" placeholder="源 IP" style="width:130px;">
+      <input id="f-dst" placeholder="目的 IP" style="width:130px;">
+      <input id="f-domain" placeholder="域名" style="width:150px;">
+      <label>从 <input type="datetime-local" id="f-from"></label>
+      <label>至 <input type="datetime-local" id="f-to"></label>
+      <select id="f-order" title="排序">
+        <option value="desc">最新优先</option>
+        <option value="asc">最早优先</option>
+      </select>
+      <button class="btn primary" id="f-search">查询</button>
+      <button class="btn" id="f-reset">重置</button>
+    </div>
+    <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>时间</th><th>类型</th><th>来源</th><th>目的</th><th>协议</th>
+        <th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>流入/流出</th>
+      </tr></thead>
+      <tbody id="l-body"></tbody>
+    </table></div>
+    <div id="l-empty" class="empty" style="display:none;">没有匹配的日志。</div>
+    <div class="pager">
+      <button class="btn sm" id="l-prev">‹ 上一页</button>
+      <span>共 <b id="l-total">0</b> 条 · 第 <b id="l-page">1</b> 页</span>
+      <button class="btn sm" id="l-next">下一页 ›</button>
+      <span class="spacer"></span>
+      <span id="l-loading" class="spin" style="display:none;"></span>
+    </div>
+  </section>
+
+  <!-- ======================= 系统管理 ======================= -->
+  <section class="view" id="view-sys">
+    <h2>系统管理</h2>
+    <div class="grid g-2">
+      <div class="card">
+        <h3>服务配置</h3>
+        <div class="config-form" id="cfg-form">
+          <label>UDP 监听地址</label><input id="c-udp" title="格式 :端口 或 IP:端口">
+          <label>HTTP 监听地址</label><input id="c-http" title="变更需重启服务">
+          <label>数据保留(天)</label><input id="c-keep" type="number" min="1" max="3650">
+          <label>数据库路径</label><span class="ro" id="c-db"></span>
+        </div>
+        <div style="margin-top:16px; display:flex; gap:8px;">
+          <button class="btn primary" id="c-save">保存配置</button>
+          <button class="btn warn" id="c-retention">立即执行保留期清理</button>
+        </div>
+        <div class="faint" style="margin-top:10px; font-size:11.5px;" id="c-note"></div>
+      </div>
+      <div class="card">
+        <h3>运行状态</h3>
+        <div class="live" id="h-live" style="margin-bottom:12px;">服务运行中</div>
+        <div class="health-row" id="h-cells">
+          <div class="cell"><b>-</b><span>运行时长(Uptime)</span></div>
+          <div class="cell"><b>-</b><span>已收 UDP 包</span></div>
+          <div class="cell"><b>-</b><span>已存记录</span></div>
+          <div class="cell"><b>-</b><span>解析错误</span></div>
+        </div>
+        <div style="margin-top:14px; font-size:12px; color:var(--text-dim);">
+          查看器: <span id="h-addr" class="mono">-</span>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 详情抽屉 -->
+<div class="drawer-bg" id="drawer-bg"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="日志详情">
+  <div class="drawer-head">
+    <h3>日志详情 <span id="d-kind" class="badge"></span></h3>
+    <button class="drawer-close" id="d-close" aria-label="关闭">×</button>
+  </div>
+  <div class="drawer-body">
+    <dl class="kv" id="d-fields"></dl>
+    <h3 style="font-size:12px; color:var(--text-dim); margin-bottom:6px;">原始内容</h3>
+    <pre class="raw" id="d-raw"></pre>
+  </div>
+</aside>
+
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

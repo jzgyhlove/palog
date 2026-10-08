@@ -1,0 +1,17 @@
+# build artifacts
+palog-linux-amd64
+palog
+*.exe
+/dist/
+
+# local runtime data
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# editor/OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
