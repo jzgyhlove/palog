@@ -296,3 +296,117 @@ func TestNoPanicOnMalformed(t *testing.T) {
 		ParseText(s)
 	}
 }
+
+// TestQQLogin3Parsing verifies the qqlogin3 IM-account text line format
+// observed in live production traffic.
+func TestQQLogin3Parsing(t *testing.T) {
+	cases := []struct {
+		line       string
+		wantUser   string
+		wantDstPort int
+		wantKind   string
+	}{
+		{
+			line:        "<PNB40200>qqlogin3 1791554877 1c-87-2c-57-d2-f9 172.16.16.47 12669 183.2.144.33 443 304408929",
+			wantUser:    "304408929",
+			wantDstPort: 443,
+			wantKind:    KindQQLogin,
+		},
+		{
+			line:        "qqlogin3 1791554889 00-11-22-33-44-55 10.0.0.8 50821 61.129.7.110 8000 123456789",
+			wantUser:    "123456789",
+			wantDstPort: 8000,
+			wantKind:    KindQQLogin,
+		},
+	}
+	for i, c := range cases {
+		got, err := ParseText(c.line)
+		if err != nil {
+			t.Errorf("case %d: %v", i, err)
+			continue
+		}
+		if got.Kind != c.wantKind {
+			t.Errorf("case %d: kind %q want %q", i, got.Kind, c.wantKind)
+		}
+		if got.User != c.wantUser {
+			t.Errorf("case %d: user %q want %q", i, got.User, c.wantUser)
+		}
+		if got.DstPort != c.wantDstPort {
+			t.Errorf("case %d: dst port %d want %d", i, got.DstPort, c.wantDstPort)
+		}
+		if got.SrcIP != "172.16.16.47" && got.SrcIP != "10.0.0.8" {
+			t.Errorf("case %d: unexpected src ip %q", i, got.SrcIP)
+		}
+		if got.MAC != "1c-87-2c-57-d2-f9" && got.MAC != "00-11-22-33-44-55" {
+			t.Errorf("case %d: unexpected mac %q", i, got.MAC)
+		}
+	}
+	// wrong field count must error
+	if _, err := ParseText("qqlogin3 1791554877 1c-87-2c-57-d2-f9 172.16.16.47 12669"); err == nil {
+		t.Error("short qqlogin3 should error")
+	}
+	// bad epoch must error
+	if _, err := ParseText("qqlogin3 notanumber aa-bb-cc-dd-ee-ff 1.2.3.4 1 5.6.7.8 443 999"); err == nil {
+		t.Error("bad epoch qqlogin3 should error")
+	}
+}
+
+// TestBinaryTLVTruncationRecovery feeds ParseBinary buffers cut short at many
+// positions and asserts the invariants proven stable across all cut points:
+//   - the decoder never fabricates records: len(got) <= len(baseline);
+//   - decoding is deterministic up to the final decoded record: every record
+//     except the last one decoded from a cut buffer equals the baseline record
+//     at the same index (only the final record may be a partial/mangled tail).
+func TestBinaryTLVTruncationRecovery(t *testing.T) {
+	payloads := extractPNBPayloads(t, "panabit_cap3.pcap")
+	if len(payloads) == 0 {
+		t.Fatal("no payloads")
+	}
+	checked := 0
+	for pi, full := range payloads {
+		baseline, err := ParseBinary(full)
+		if err != nil {
+			t.Fatalf("packet %d: baseline parse: %v", pi, err)
+		}
+		if len(baseline) < 2 {
+			continue
+		}
+		for cut := hdrLen; cut < len(full); cut += 7 {
+			got, _ := ParseBinary(full[:cut])
+			if len(got) > len(baseline) {
+				t.Fatalf("packet %d cut %d: %d records > baseline %d (fabricated)", pi, cut, len(got), len(baseline))
+			}
+			for i := 0; i < len(got)-1; i++ {
+				if !sameRecord(got[i], baseline[i]) {
+					t.Fatalf("packet %d cut %d: record %d diverges from baseline (only the final record may be affected)",
+						pi, cut, i)
+				}
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no cut points checked")
+	}
+	t.Logf("verified %d cut points: no fabricated records, all-but-final records deterministic", checked)
+}
+
+func sameRecord(a, b Record) bool {
+	if a.MAC != b.MAC || a.TS1 != b.TS1 || a.TS2 != b.TS2 ||
+		a.Appid != b.Appid || a.Proto != b.Proto || a.Type != b.Type ||
+		a.Iface != b.Iface || a.Src != b.Src || a.Dst != b.Dst ||
+		a.Sport != b.Sport || a.Dport != b.Dport || a.Domain != b.Domain ||
+		a.HasTuple != b.HasTuple || a.HasIface2 != b.HasIface2 ||
+		a.HasFlags != b.HasFlags || a.BytesIn != b.BytesIn || a.BytesOut != b.BytesOut {
+		return false
+	}
+	if len(a.Counters) != len(b.Counters) {
+		return false
+	}
+	for i := range a.Counters {
+		if a.Counters[i] != b.Counters[i] {
+			return false
+		}
+	}
+	return true
+}

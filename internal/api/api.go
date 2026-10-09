@@ -22,6 +22,10 @@ import (
 
 const sessionTTL = 12 * time.Hour
 
+// minPasswordLen is the minimum acceptable password length (enforced on
+// self-service password change; admin creation keeps its own policy).
+const minPasswordLen = 6
+
 // Server wires the store, receiver and HTTP console together.
 type Server struct {
 	Store   *store.Store
@@ -48,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	// authenticated
 	mux.HandleFunc("POST /api/logout", s.auth(s.handleLogout))
 	mux.HandleFunc("GET /api/me", s.auth(s.handleMe))
+	mux.HandleFunc("PUT /api/me/password", s.auth(s.handleChangePassword))
 	mux.HandleFunc("GET /api/stats", s.auth(s.handleStats))
 	mux.HandleFunc("GET /api/logs", s.auth(s.handleLogs))
 	mux.HandleFunc("GET /api/logs/{id}", s.auth(s.handleLogByID))
@@ -206,6 +211,58 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, publicUser(userFrom(r)))
+}
+
+// handleChangePassword lets an authenticated user change their own password.
+// The old password must be supplied (verified against the stored hash) and
+// the new password must meet the minimum length. All other sessions of the
+// user are revoked so a stolen token dies with the old password.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	u := userFrom(r)
+	if u == nil {
+		writeErr(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	// GetUserByToken blanks PassHash, so fetch the hash-carrying row to
+	// verify the current password.
+	full, err := s.Store.GetUserByUsername(u.Username)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if full == nil || in.OldPassword == "" || !store.CheckPassword(full.PassHash, in.OldPassword) {
+		writeErr(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+	if len(in.NewPassword) < minPasswordLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("new password must be at least %d characters", minPasswordLen))
+		return
+	}
+	if in.NewPassword == in.OldPassword {
+		writeErr(w, http.StatusBadRequest, "new password must differ from the current password")
+		return
+	}
+	if err := s.Store.UpdateUser(u.ID, "", "", in.NewPassword); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Keep the current session, revoke every other one.
+	tok := bearerToken(r)
+	if tok != "" {
+		if err := s.Store.DeleteSessionsExcept(u.ID, tok); err != nil {
+			slog.Warn("change password: revoke other sessions", "user", u.Username, "err", err)
+		}
+	}
+	slog.Info("password changed", "user", u.Username)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func publicUser(u *store.User) map[string]interface{} {

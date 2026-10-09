@@ -103,6 +103,13 @@ Body:`{"username":"admin","password":"..."}`。
 #### GET /api/me
 当前用户:`{"id":1,"username":"admin","role":"admin","devices":"*"}`。
 
+#### PUT /api/me/password
+自助修改当前用户密码。Body:`{"old_password":"...","new_password":"..."}`。
+- `old_password` 错误 → `401 {"error":"current password is incorrect"}`
+- `new_password` 少于 6 位或与旧密码相同 → `400`
+- 成功:`200 {"ok":true}`,并吊销该用户除当前 token 外的**所有其他会话**(本会话保持有效)
+- 改密后旧密码立即失效,其他设备/浏览器的历史 token 全部作废
+
 #### GET /api/stats
 仪表盘数据。`?device=` 过滤单设备(普通用户仅能查权限内设备,越权 → 403):
 ```json

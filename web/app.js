@@ -168,6 +168,57 @@ $('btn-logout').addEventListener('click', async () => {
   showLogin('已退出登录');
 });
 
+/* ---------------- change password ---------------- */
+const pwdBg = $('pwd-bg');
+
+function openPwd() {
+  $('pwd-err').textContent = '';
+  $('pwd-form').reset();
+  pwdBg.classList.add('open');
+  setTimeout(() => $('pw-old').focus(), 60);
+}
+function closePwd() {
+  pwdBg.classList.remove('open');
+}
+
+$('btn-chgpwd').addEventListener('click', openPwd);
+$('pw-cancel').addEventListener('click', closePwd);
+pwdBg.addEventListener('click', (e) => { if (e.target === pwdBg) closePwd(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && pwdBg.classList.contains('open')) closePwd();
+});
+
+$('pwd-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('pw-btn');
+  const err = $('pwd-err');
+  err.textContent = '';
+  const oldPw = $('pw-old').value;
+  const newPw = $('pw-new').value;
+  if (newPw !== $('pw-new2').value) {
+    err.textContent = '两次输入的新密码不一致';
+    return;
+  }
+  if (newPw.length < 6) {
+    err.textContent = '新密码至少 6 位';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await api('/api/me/password', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
+    });
+    closePwd();
+    toast('密码修改成功');
+  } catch (err2) {
+    err.textContent = err2.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 /* datetime-local <-> unix */
 function toDTLocal(ts) {
   if (!ts) return '';

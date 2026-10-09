@@ -350,6 +350,95 @@ func TestDevicesCRUDApi(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestChangePassword(t *testing.T) {
+	ts, _ := newTestServer(t)
+	utok, _ := login(t, ts, "user1", "userpw")
+
+	// wrong current password -> 401
+	resp := doAuth(t, "PUT", ts.URL+"/api/me/password", utok,
+		bytes.NewBufferString(`{"old_password":"nope","new_password":"newpw123"}`))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong old pw status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// new password too short -> 400
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", utok,
+		bytes.NewBufferString(`{"old_password":"userpw","new_password":"abc"}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("short new pw status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// new password equals old -> 400
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", utok,
+		bytes.NewBufferString(`{"old_password":"userpw","new_password":"userpw"}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("same pw status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// no auth -> 401
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", "",
+		bytes.NewBufferString(`{"old_password":"userpw","new_password":"newpw123"}`))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// good change -> 200
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", utok,
+		bytes.NewBufferString(`{"old_password":"userpw","new_password":"newpw123"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("good change status %d, want 200: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+
+	// old password no longer works → login returns 401
+	resp = postJSON(ts.URL+"/api/login", `{"username":"user1","password":"userpw"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old pw login status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// new password works
+	tok2, _ := login(t, ts, "user1", "newpw123")
+	if len(tok2) < 32 {
+		t.Fatalf("new pw login token too short")
+	}
+
+	// subsequent wrong-old password attempts still rejected under new token
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", tok2,
+		bytes.NewBufferString(`{"old_password":"userpw","new_password":"another1"}`))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("post-change old pw status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// second login token dies after a password change: open two sessions,
+	// change the password, other session must be revoked.
+	tokA, _ := login(t, ts, "user1", "newpw123")
+	tokB, _ := login(t, ts, "user1", "newpw123")
+	resp = doAuth(t, "PUT", ts.URL+"/api/me/password", tokA,
+		bytes.NewBufferString(`{"old_password":"newpw123","new_password":"finalpw99"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second change status %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// tokA (the changer) stays valid
+	resp = doAuth(t, "GET", ts.URL+"/api/me", tokA, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("changer token revoked, want 200, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// tokB (other session) must be revoked
+	resp = doAuth(t, "GET", ts.URL+"/api/me", tokB, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("other session token still valid, want 401, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func readAll(r io.Reader) string {
 	b, _ := io.ReadAll(r)
 	return strings.TrimSpace(string(b))

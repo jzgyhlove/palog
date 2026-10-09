@@ -26,6 +26,26 @@
   </div>
 </div>
 
+<!-- 修改密码覆盖层 -->
+<div class="login-bg" id="pwd-bg">
+  <div class="login-card">
+    <div class="brand" style="margin-bottom:18px;"><span class="dot"></span><b>palog</b></div>
+    <h1>修改密码</h1>
+    <p class="sub">先验证当前密码,再设置新密码</p>
+    <form id="pwd-form" autocomplete="off">
+      <label for="pw-old">当前密码</label>
+      <input id="pw-old" name="old_password" type="password" autocomplete="current-password" placeholder="当前密码" required>
+      <label for="pw-new">新密码(至少 6 位)</label>
+      <input id="pw-new" name="new_password" type="password" autocomplete="new-password" placeholder="新密码" required minlength="6">
+      <label for="pw-new2">确认新密码</label>
+      <input id="pw-new2" type="password" autocomplete="new-password" placeholder="再次输入新密码" required minlength="6">
+      <button class="btn primary" type="submit" id="pw-btn">保 存</button>
+    </form>
+    <div class="login-err" id="pwd-err"></div>
+    <button class="btn" type="button" id="pw-cancel" style="margin-top:8px;">取 消</button>
+  </div>
+</div>
+
 <header>
   <div class="brand"><span class="dot"></span><b>palog</b><small>Panabit 日志审计</small></div>
   <nav class="tabs">
@@ -37,6 +57,7 @@
     <span class="live" id="live-dot">实时</span>
     <span id="live-stats" class="mono" title="包数 / 记录数 / 解析错误">-</span>
     <span class="who" id="whoami" title="">-</span>
+    <button class="btn sm" id="btn-chgpwd" title="修改自己的登录密码">修改密码</button>
     <button class="btn sm" id="btn-logout" title="退出登录">退出</button>
   </div>
 </header>

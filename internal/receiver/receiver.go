@@ -282,7 +282,12 @@ func (r *Receiver) writerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			for {
 				select {
-				case e := <-r.ch:
+				case e, ok := <-r.ch:
+					if !ok {
+						// channel closed by Run: all queued entries are drained
+						flush()
+						return
+					}
 					pending = append(pending, e...)
 				default:
 					flush()

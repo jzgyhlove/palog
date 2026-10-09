@@ -19,6 +19,7 @@ const (
 	KindDNS    = "dnsquery"
 	KindHTTP   = "http"
 	KindSess   = "session"
+	KindQQLogin = "qqlogin" // qqlogin3 text lines: IM account login events
 )
 
 // TextLog is a normalized text log line.
@@ -89,6 +90,33 @@ func ParseText(line string) (TextLog, error) {
 		}
 		t.DstPort = 53
 		t.Domain = f[7]
+	case "qqlogin3":
+		// qqlogin3 <epoch> <mac> <srcip> <srcport> <dstip> <dstport> <qqid>
+		if len(f) != 8 {
+			return TextLog{}, fmt.Errorf("qqlogin3: want 8 fields, got %d", len(f))
+		}
+		t.Kind = KindQQLogin
+		t.MAC = f[2]
+		t.SrcIP = f[3]
+		if net.ParseIP(t.SrcIP) == nil {
+			return TextLog{}, fmt.Errorf("bad src ip %q", t.SrcIP)
+		}
+		p, err := strconv.Atoi(f[4])
+		if err != nil {
+			return TextLog{}, fmt.Errorf("bad src port %q", f[4])
+		}
+		t.SrcPort = p
+		t.DstIP = f[5]
+		if net.ParseIP(t.DstIP) == nil {
+			return TextLog{}, fmt.Errorf("bad dst ip %q", t.DstIP)
+		}
+		dp, err := strconv.Atoi(f[6])
+		if err != nil {
+			return TextLog{}, fmt.Errorf("bad dst port %q", f[6])
+		}
+		t.DstPort = dp
+		// account id is the login subject; keep it in User for UI consistency
+		t.User = f[7]
 	case "HTTP4":
 		if len(f) < 12 {
 			return TextLog{}, fmt.Errorf("HTTP4: want >=12 fields, got %d", len(f))

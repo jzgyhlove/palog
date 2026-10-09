@@ -1056,6 +1056,13 @@ func (s *Store) DeleteSession(token string) error {
 	return err
 }
 
+// DeleteSessionsExcept revokes every session of userID except keepToken
+// (used after a password change so the caller stays logged in).
+func (s *Store) DeleteSessionsExcept(userID int64, keepToken string) error {
+	_, err := s.db.Exec("DELETE FROM sessions WHERE user_id=? AND token<>?", userID, keepToken)
+	return err
+}
+
 // CleanExpiredSessions deletes expired tokens (called periodically).
 func (s *Store) CleanExpiredSessions() error {
 	_, err := s.db.Exec("DELETE FROM sessions WHERE expires < ?", time.Now().Unix())
