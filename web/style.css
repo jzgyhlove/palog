@@ -241,3 +241,53 @@ pre.raw {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- login overlay ---------- */
+.login-bg {
+  position: fixed; inset: 0; z-index: 100; display: none;
+  align-items: center; justify-content: center;
+  background: radial-gradient(900px 500px at 50% -10%, #14213a 0%, var(--bg) 65%);
+}
+.login-bg.open { display: flex; }
+.login-card {
+  width: min(360px, 92vw); padding: 30px 30px 22px;
+  background: var(--panel); border: 1px solid var(--border-hi); border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0,0,0,.5);
+}
+.login-card h1 { font-size: 16px; margin-bottom: 4px; }
+.login-card .sub { color: var(--text-dim); font-size: 12px; margin-bottom: 18px; }
+.login-card form { display: flex; flex-direction: column; gap: 6px; }
+.login-card label { color: var(--text-dim); font-size: 12px; margin-top: 6px; }
+.login-card input {
+  background: var(--bg-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 5px; padding: 9px 11px; font-size: 13.5px; outline: none;
+}
+.login-card input:focus { border-color: var(--accent-2); }
+.login-card .btn { margin-top: 16px; padding: 9px; font-size: 13.5px; }
+.login-err { color: var(--danger); font-size: 12.5px; margin-top: 12px; min-height: 16px; }
+.who { color: var(--text-dim); font-size: 12px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- inline select (仪表盘标题) ---------- */
+.inline-select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 8px; font-size: 12px; outline: none; margin-left: 6px;
+}
+.inline-select:focus { border-color: var(--accent-2); }
+
+/* ---------- device badge ---------- */
+.badge.dev { background: rgba(34,211,238,.08); color: var(--accent); border: 1px solid rgba(34,211,238,.28); font-weight: 500; }
+.ok-txt { color: var(--ok); font-size: 12px; }
+
+/* ---------- system subtabs ---------- */
+.subtabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
+.subtabs button {
+  background: none; border: 1px solid var(--border); color: var(--text-dim);
+  padding: 6px 14px; border-radius: 6px; font-size: 12.5px; transition: all .15s;
+}
+.subtabs button:hover { color: var(--text); border-color: var(--border-hi); }
+.subtabs button.active { color: var(--accent); background: rgba(34,211,238,.1); border-color: rgba(34,211,238,.4); }
+.subview { display: none; }
+.subview.active { display: block; }
+.chk { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 12.5px; }
+.chk input { accent-color: var(--accent-2); }
+.toolbar .spacer { flex: 1; }

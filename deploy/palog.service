@@ -6,7 +6,9 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/palog
-ExecStart=/opt/palog/palog -db /opt/palog/palog.db -udp :40200 -http 0.0.0.0:8080
+# 初始 admin 密码只存在服务器本地,不进 git;无用户时才生效
+EnvironmentFile=-/etc/palog/admin.env
+ExecStart=/opt/palog/palog -db /opt/palog/palog.db -http 0.0.0.0:8080 -admin-pw ${PALOG_ADMIN_PW}
 Restart=always
 RestartSec=3
 # 波动大时静默 OOM 误杀日志刷屏

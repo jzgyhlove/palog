@@ -1,4 +1,6 @@
-/* palog 日志审计控制台 — vanilla JS,无构建步骤 */
+/* palog 日志审计控制台 — vanilla JS,无构建步骤
+ * 多设备(端口命名) + 多用户(按设备授权) + Bearer token 鉴权
+ */
 'use strict';
 
 /* ---------------- helpers ---------------- */
@@ -55,6 +57,17 @@ function fmtBytes(b) {
   return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
 }
 
+function fmtNum(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+function devBadge(name) {
+  if (!name) return '<span class="faint">-</span>';
+  return '<span class="badge dev">' + esc(name) + '</span>';
+}
+
 /* toasts */
 function toast(msg, isErr) {
   const el = document.createElement('div');
@@ -65,17 +78,95 @@ function toast(msg, isErr) {
   setTimeout(() => el.remove(), 4000);
 }
 
-/* api helper */
+/* ---------------- auth ---------------- */
+const TOKEN_KEY = 'palog_token';
+let ME = null; // {id,username,role,devices}
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+function setToken(t) { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); }
+
 async function api(path, options) {
-  const res = await fetch(path, options);
+  options = options || {};
+  const headers = Object.assign({}, options.headers || {});
+  const tok = getToken();
+  if (tok) headers['Authorization'] = 'Bearer ' + tok;
+  const res = await fetch(path, Object.assign({}, options, { headers }));
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-json */ }
+  if (res.status === 401 && !path.startsWith('/api/login')) {
+    showLogin('会话已过期，请重新登录');
+    throw new Error('unauthorized');
+  }
   if (!res.ok) {
     const msg = data && data.error ? data.error : ('HTTP ' + res.status);
     throw new Error(msg);
   }
   return data;
 }
+
+function showLogin(msg) {
+  setToken('');
+  ME = null;
+  $('login-err').textContent = msg || '';
+  $('login-bg').classList.add('open');
+  setTimeout(() => $('li-user').focus(), 60);
+}
+
+async function setupAuth() {
+  if (!getToken()) { showLogin(''); return; }
+  try {
+    ME = await api('/api/me');
+    applyMe();
+  } catch (e) {
+    showLogin('无法验证登录状态');
+  }
+}
+
+function applyMe() {
+  $('login-bg').classList.remove('open');
+  const who = $('whoami');
+  who.textContent = ME.username + ' · ' + (ME.role === 'admin' ? '管理员' : '用户');
+  who.title = '可访问设备: ' + (ME.devices || '*');
+  // admin-only controls
+  document.querySelectorAll('.admin-only').forEach(el => el.style.display =
+    ME.role === 'admin' ? '' : 'none');
+  if (ME.role !== 'admin' && $('sys-devices') && $('sys-devices').classList.contains('active')) {
+    switchSub('stat');
+  }
+  // announce to global listeners
+  document.dispatchEvent(new CustomEvent('palog:me', { detail: ME }));
+}
+
+$('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('li-btn');
+  btn.disabled = true;
+  $('login-err').textContent = '';
+  try {
+    const r = await api('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('li-user').value.trim(), password: $('li-pass').value }),
+    });
+    setToken(r.token);
+    ME = r.user;
+    applyMe();
+    $('li-pass').value = '';
+    refreshLive(); refreshDash(); refreshDevices(); refreshUsers();
+    toast('欢迎，' + ME.username);
+  } catch (err) {
+    $('login-err').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('btn-logout').addEventListener('click', async () => {
+  try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+  setToken('');
+  ME = null;
+  showLogin('已退出登录');
+});
 
 /* datetime-local <-> unix */
 function toDTLocal(ts) {
@@ -91,6 +182,21 @@ function fromDTLocal(v) {
   return isNaN(t) ? 0 : Math.floor(t / 1000);
 }
 
+/* ---------------- device filter ---------------- */
+let DEVICES = []; // visible devices (server already scoped by role)
+
+async function refreshDevices() {
+  try {
+    const r = await api('/api/devices');
+    DEVICES = (r.devices || []);
+    const opts = (['<option value="">全部设备</option>']).concat(
+      DEVICES.map(d => '<option value="' + esc(d.name) + '">' + esc(d.name) + (d.enabled ? '' : ' (已禁用)') + '</option>')
+    ).join('');
+    $('f-device').innerHTML = opts;
+    $('d-device').innerHTML = opts;
+  } catch (e) { /* 401 handled globally */ }
+}
+
 /* ---------------- tab navigation ---------------- */
 function switchView(name) {
   document.querySelectorAll('nav.tabs button').forEach(b =>
@@ -103,8 +209,22 @@ function switchView(name) {
 document.querySelectorAll('nav.tabs button').forEach(b =>
   b.addEventListener('click', () => switchView(b.dataset.view)));
 
+/* system subtabs */
+function switchSub(name) {
+  document.querySelectorAll('#sys-tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.sub === name));
+  document.querySelectorAll('.subview').forEach(v => {
+    v.classList.toggle('active', v.id === 'sys-' + name);
+  });
+  if (name === 'devices') refreshDevTable();
+  if (name === 'users') refreshUsersTable();
+  if (name === 'config') refreshConfig();
+  if (name === 'stat') refreshSys();
+}
+document.querySelectorAll('#sys-tabs button').forEach(b =>
+  b.addEventListener('click', () => switchSub(b.dataset.sub)));
+
 /* ---------------- live header ---------------- */
-let liveTimer = null;
 async function refreshLive() {
   try {
     const h = await api('/api/health');
@@ -120,7 +240,9 @@ async function refreshLive() {
 let drawerId = 0;
 function openDrawer(id) {
   drawerId = id;
-  api('/api/logs/' + id).then(renderDrawer).catch(err => toast('加载详情失败: ' + err.message, true));
+  api('/api/logs/' + id).then(renderDrawer).catch(err => {
+    if (err.message !== 'unauthorized') toast('加载详情失败: ' + err.message, true);
+  });
 }
 async function renderDrawer(item) {
   const m = { dnsquery: 'dns', http: 'http', session: 'sess' };
@@ -129,7 +251,8 @@ async function renderDrawer(item) {
   $('d-kind').textContent = item.kind;
 
   const rows = [
-    ['ID', item.id], ['类型', item.kind], ['接收时间', item.recv_ts ? fmtTime(item.recv_ts) : '-'],
+    ['ID', item.id], ['设备', item.device], ['类型', item.kind],
+    ['接收时间', item.recv_ts ? fmtTime(item.recv_ts) : '-'],
     ['记录时间', item.ts ? fmtTime(item.ts) : '-'], ['结束时间', item.ts_end ? fmtTime(item.ts_end) : '-'],
     ['源地址', item.src_ip ? item.src_ip + (item.src_port ? ':' + item.src_port : '') : ''],
     ['目的地址', item.dst_ip ? item.dst_ip + (item.dst_port ? ':' + item.dst_port : '') : ''],
@@ -210,12 +333,27 @@ function kindShare(byKind) {
   }).join('');
 }
 
+function devShare(byDevice) {
+  const entries = Object.entries(byDevice || {}).sort((a, b) => b[1] - a[1]);
+  const el = $('s-devices');
+  if (entries.length === 0) { el.innerHTML = '<div class="h-empty">暂无数据或无跨设备数据</div>'; return; }
+  const total = entries.reduce((s, e) => s + e[1], 0) || 1;
+  el.innerHTML = entries.map(([k, v]) => {
+    const pct = Math.round(v / total * 100);
+    return '<div class="bar-row">' +
+      '<span class="key" style="font-family:var(--sans)">' + esc(k) + '</span>' +
+      '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>' +
+      '<span class="cnt">' + fmtNum(v) + ' (' + pct + '%)</span></div>';
+  }).join('');
+}
+
 function recentRow(item) {
   const target = item.kind === 'dnsquery' ? item.domain : item.host;
   const path = item.kind === 'http' ? item.path : '';
   const id = item.id;
   return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
     '<td class="mono dim" title="' + esc(fmtTime(item.ts)) + '">' + esc(fmtTime(item.ts)) + ' <span class="faint">' + esc(relTime(item.ts)) + '</span></td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
     '<td>' + kindBadge(item.kind) + '</td>' +
     '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
     '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
@@ -228,16 +366,20 @@ function recentRow(item) {
 
 async function refreshDash() {
   try {
-    const s = await api('/api/stats');
+    const dev = $('d-device').value;
+    const params = new URLSearchParams();
+    if (dev) params.set('device', dev);
+    const qs = params.toString();
+    const s = await api('/api/stats' + (qs ? '?' + qs : ''));
     $('s-total').textContent = fmtNum(s.total);
     $('s-hour').textContent = fmtNum(s.last_hour);
     $('s-pps').innerHTML = s.pps.toFixed(2) + ' <small>包/秒</small>';
     $('s-pkts').innerHTML = fmtNum(s.packets) + ' / ' + fmtNum(s.records);
     $('s-errs').textContent = fmtNum(s.parse_errors);
-    $('s-total').textContent = fmtNum(s.total);
     kindShare(s.by_kind);
     barList($('s-domains'), s.top_domains);
     barList($('s-srcip'), s.top_src_ip);
+    devShare(s.by_device);
     renderHourly(s.hourly);
     const tb = $('s-recent');
     if (s.recent && s.recent.length) {
@@ -248,15 +390,11 @@ async function refreshDash() {
       $('s-recent-empty').style.display = 'block';
     }
   } catch (err) {
-    toast('仪表盘加载失败: ' + err.message, true);
+    if (err.message !== 'unauthorized') toast('仪表盘加载失败: ' + err.message, true);
   }
 }
 
-function fmtNum(n) {
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
-  return String(n);
-}
+$('d-device').addEventListener('change', refreshDash);
 
 /* recent table row click (event delegation) */
 document.addEventListener('click', (e) => {
@@ -275,6 +413,7 @@ const queryState = { limit: 100, offset: 0 };
 
 function buildQueryParams() {
   const p = new URLSearchParams();
+  const dev = $('f-device').value; if (dev) p.set('device', dev);
   const k = $('f-kind').value; if (k) p.set('kind', k);
   const q = $('f-q').value.trim(); if (q) p.set('q', q);
   const s = $('f-src').value.trim(); if (s) p.set('src_ip', s);
@@ -296,6 +435,7 @@ function logRow(item, idx) {
   const id = item.id;
   return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
     '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
     '<td>' + kindBadge(item.kind) + '</td>' +
     '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
     '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
@@ -309,7 +449,7 @@ function logRow(item, idx) {
 
 async function runQuery() {
   const tb = $('l-body');
-  tb.innerHTML = '<tr><td colspan="9"><div class="empty"><span class="spin" style="vertical-align:-2px;margin-right:8px;"></span>查询中…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="10"><div class="empty"><span class="spin" style="vertical-align:-2px;margin-right:8px;"></span>查询中…</div></td></tr>';
   $('l-loading').style.display = 'inline-block';
   $('l-prev').disabled = true;
   $('l-next').disabled = true;
@@ -323,6 +463,7 @@ async function runQuery() {
     $('l-prev').disabled = queryState.offset <= 0;
     $('l-next').disabled = queryState.offset + items.length >= r.total;
   } catch (err) {
+    if (err.message === 'unauthorized') return;
     tb.innerHTML = '';
     $('l-empty').style.display = 'block';
     $('l-empty').textContent = '查询失败: ' + err.message;
@@ -341,6 +482,7 @@ $('f-q').addEventListener('input', () => {
 $('f-search').addEventListener('click', () => { queryState.offset = 0; runQuery(); });
 $('f-kind').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
 $('f-order').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
+$('f-device').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
 ['f-src', 'f-dst', 'f-domain', 'f-from', 'f-to'].forEach(id =>
   $(id).addEventListener('change', () => { queryState.offset = 0; runQuery(); }));
 $('l-prev').addEventListener('click', () => {
@@ -352,7 +494,7 @@ $('l-next').addEventListener('click', () => {
   runQuery();
 });
 $('f-reset').addEventListener('click', () => {
-  ['f-kind', 'f-q', 'f-src', 'f-dst', 'f-domain', 'f-from', 'f-to', 'f-order'].forEach(id => {
+  ['f-device', 'f-kind', 'f-q', 'f-src', 'f-dst', 'f-domain', 'f-from', 'f-to', 'f-order'].forEach(id => {
     if (id === 'f-kind' || id === 'f-order') $(id).value = id === 'f-kind' ? '' : 'desc';
     else if (id === 'f-from' || id === 'f-to') $(id).value = '';
     else $(id).value = '';
@@ -361,21 +503,8 @@ $('f-reset').addEventListener('click', () => {
   runQuery();
 });
 
-/* ---------------- system management ---------------- */
-let cfgCache = null;
-
+/* ---------------- 系统管理: 运行状态 ---------------- */
 async function refreshSys() {
-  try {
-    const cfg = await api('/api/config');
-    cfgCache = cfg;
-    $('c-udp').value = cfg.listen_udp || '';
-    $('c-http').value = cfg.http_addr || '';
-    $('c-keep').value = cfg.retention_days != null ? cfg.retention_days : '';
-    $('c-db').textContent = cfg.db_path || '-';
-    $('c-note').textContent = cfg.listen_udp ? '' : '';
-  } catch (e) {
-    toast('读取配置失败: ' + e.message, true);
-  }
   try {
     const h = await api('/api/health');
     const cells = [
@@ -386,11 +515,13 @@ async function refreshSys() {
     ];
     $('h-cells').innerHTML = cells.map(([v, l]) =>
       '<div class="cell"><b>' + esc(typeof v === 'string' ? v : fmtNum(v)) + '</b><span>' + esc(l) + '</span></div>').join('');
-    $('h-addr').textContent = h.listen_udp || '-';
+    const listeners = (h.listeners || []).map(l =>
+      '<span class="badge dev" style="margin-right:4px;">' + esc(l.device) +
+      ' :' + esc(l.port) + (l.active ? '' : ' (关)') + '</span>').join('');
+    $('h-listeners').innerHTML = listeners || '无';
     $('h-live').textContent = h.ok ? '服务运行中' : '服务异常';
   } catch (e) {
-    $('h-live').textContent = '无法连接服务';
-    toast('读取运行状态失败: ' + e.message, true);
+    if (e.message !== 'unauthorized') { $('h-live').textContent = '无法连接服务'; }
   }
 }
 
@@ -400,12 +531,197 @@ function secToDur(sec) {
   return (d ? d + ' 天 ' : '') + hh + ' 时 ' + mm + ' 分';
 }
 
+/* ---------------- 系统管理: 设备管理 (admin) ---------------- */
+let editingDeviceId = 0;
+
+async function refreshDevTable() {
+  try {
+    const r = await api('/api/devices');
+    const items = r.devices || [];
+    $('dv-hint').textContent = '共 ' + items.length + ' 个设备';
+    const tb = $('dv-body');
+    tb.innerHTML = items.map(d =>
+      '<tr>' +
+      '<td class="faint">' + d.id + '</td>' +
+      '<td>' + devBadge(d.name) + '</td>' +
+      '<td class="mono">' + d.port + '</td>' +
+      '<td>' + (d.enabled ? '<span class="ok-txt">启用</span>' : '<span class="faint">已禁用</span>') + '</td>' +
+      '<td>' +
+      '<button class="btn sm" data-edit="' + d.id + '">编辑</button> ' +
+      '<button class="btn sm danger" data-del="' + d.id + '">删除</button>' +
+      '</td></tr>'
+    ).join('');
+  } catch (e) { /* 401 global */ }
+}
+
+$('dv-add').addEventListener('click', async () => {
+  const name = $('dv-name').value.trim();
+  const port = parseInt($('dv-port').value, 10);
+  if (!name) { toast('请填写设备名称', true); return; }
+  if (!port || port < 1 || port > 65535) { toast('端口须为 1-65535', true); return; }
+  try {
+    await api('/api/devices', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: editingDeviceId, name, port, enabled: $('dv-enabled').checked }),
+    });
+    toast(editingDeviceId ? '设备已更新，监听将在 1 秒内迁移' : '设备已添加，监听已启动');
+    editingDeviceId = 0;
+    $('dv-add').textContent = '添加 / 更新设备';
+    $('dv-name').value = ''; $('dv-port').value = '';
+    refreshDevTable(); refreshDevices();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('保存失败: ' + e.message, true);
+  }
+});
+
+$('dv-body').addEventListener('click', async (e) => {
+  const editBtn = e.target.closest('button[data-edit]');
+  if (editBtn) {
+    try {
+      const r = await api('/api/devices');
+      const d = (r.devices || []).find(x => x.id === Number(editBtn.dataset.edit));
+      if (!d) return;
+      editingDeviceId = d.id;
+      $('dv-name').value = d.name;
+      $('dv-port').value = d.port;
+      $('dv-enabled').checked = d.enabled;
+      $('dv-add').textContent = '保存修改(' + d.name + ')';
+      toast('正在编辑「' + d.name + '」');
+      return;
+    } catch (err) { return; }
+  }
+  const delBtn = e.target.closest('button[data-del]');
+  if (delBtn) {
+    const id = Number(delBtn.dataset.del);
+    if (!confirm('确定删除该设备及其监听端口吗？历史日志会保留，但需重新配置。')) return;
+    try {
+      const r = await api('/api/devices/' + id, { method: 'DELETE' });
+      toast('设备已删除');
+      refreshDevTable(); refreshDevices();
+    } catch (err) {
+      if (err.message !== 'unauthorized') toast('删除失败: ' + err.message, true);
+    }
+  }
+});
+
+/* ---------------- 系统管理: 用户管理 (admin) ---------------- */
+const ROLE_NAME = { admin: '管理员', user: '普通用户' };
+
+async function refreshUsersTable() {
+  try {
+    const r = await api('/api/users');
+    const items = r.users || [];
+    const tb = $('us-body');
+    tb.innerHTML = items.map(u =>
+      '<tr>' +
+      '<td class="faint">' + u.id + '</td>' +
+      '<td>' + esc(u.username) + (u.id === ME.id ? ' <span class="faint">(当前)</span>' : '') + '</td>' +
+      '<td>' + (u.role === 'admin' ? '<span class="badge dev">管理员</span>' : '<span class="badge proto">用户</span>') + '</td>' +
+      '<td class="mono dim">' + esc(u.devices || '') + '</td>' +
+      '<td class="faint">' + fmtTime(u.created_at) + '</td>' +
+      '<td>' +
+      '<button class="btn sm" data-u-edit="' + u.id + '">编辑</button> ' +
+      (u.id !== ME.id ? '<button class="btn sm danger" data-u-del="' + u.id + '">删除</button>' : '') +
+      '</td></tr>'
+    ).join('');
+  } catch (e) { /* 401 */ }
+}
+
+let editingUserId = 0;
+
+function fillUserForm(u) {
+  editingUserId = u.id;
+  $('us-name').value = u.username;
+  $('us-name').disabled = true;
+  $('us-pass').value = '';
+  $('us-pass').placeholder = '留空则不修改密码';
+  $('us-role').value = u.role;
+  $('us-devices').value = u.role === 'admin' ? '*' : (u.devices || '');
+  $('us-add').textContent = '保存修改(' + u.username + ')';
+}
+
+$('us-add').addEventListener('click', async () => {
+  const name = $('us-name').value.trim();
+  const role = $('us-role').value;
+  if (!name) { toast('请填写用户名', true); return; }
+  const payload = { username: name, role };
+  if (role === 'admin') {
+    payload.devices = '*';
+  } else {
+    const devs = $('us-devices').value.trim();
+    payload.devices = devs ? devs.replace(/，/g, ',').split(',').map(s => s.trim()).filter(Boolean).join(',') : '';
+  }
+  try {
+    if (editingUserId) {
+      const devs = $('us-devices').value.trim();
+      await api('/api/users/' + editingUserId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role, devices: role === 'admin' ? '*' : devs, password: $('us-pass').value }),
+      });
+      toast('用户已更新');
+    } else {
+      payload.password = $('us-pass').value;
+      await api('/api/users', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      toast('用户已创建');
+    }
+    editingUserId = 0;
+    $('us-name').disabled = false;
+    $('us-pass').value = '';
+    $('us-pass').placeholder = '密码(仅创建时填写)';
+    $('us-add').textContent = '创建用户';
+    refreshUsersTable();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('保存失败: ' + e.message, true);
+  }
+});
+
+$('us-body').addEventListener('click', async (e) => {
+  const editBtn = e.target.closest('button[data-u-edit]');
+  if (editBtn) {
+    try {
+      const r = await api('/api/users');
+      const u = (r.users || []).find(x => x.id === Number(editBtn.dataset.uEdit));
+      if (u) fillUserForm(u);
+    } catch (err) { /* ignore */ }
+    return;
+  }
+  const delBtn = e.target.closest('button[data-u-del]');
+  if (delBtn) {
+    const id = Number(delBtn.dataset.uDel);
+    if (!confirm('确定删除该用户？')) return;
+    try {
+      await api('/api/users/' + id, { method: 'DELETE' });
+      toast('用户已删除');
+      refreshUsersTable();
+    } catch (err) {
+      if (err.message !== 'unauthorized') toast('删除失败: ' + err.message, true);
+    }
+  }
+});
+
+/* ---------------- 系统管理: 服务配置 (admin) ---------------- */
+let cfgCache = null;
+
+async function refreshConfig() {
+  try {
+    const cfg = await api('/api/config');
+    cfgCache = cfg;
+    $('c-http').value = cfg.http_addr || '';
+    $('c-keep').value = cfg.retention_days != null ? cfg.retention_days : '';
+    $('c-db').textContent = cfg.db_path || '-';
+  } catch (e) { /* 401 */ }
+}
+
 $('c-save').addEventListener('click', async () => {
   const body = {};
-  const udp = $('c-udp').value.trim();
   const http = $('c-http').value.trim();
   const keep = parseInt($('c-keep').value, 10);
-  if (udp && udp !== cfgCache.listen_udp) body.listen_udp = udp;
   if (http && http !== cfgCache.http_addr) body.http_addr = http;
   if (keep && keep !== cfgCache.retention_days) body.retention_days = keep;
   if (Object.keys(body).length === 0) { toast('没有要保存的变更'); return; }
@@ -416,16 +732,11 @@ $('c-save').addEventListener('click', async () => {
       body: JSON.stringify(body),
     });
     cfgCache = r.config;
-    $('c-udp').value = r.config.listen_udp;
     $('c-http').value = r.config.http_addr;
     $('c-keep').value = r.config.retention_days;
-    if (r.restart_required) {
-      toast('已保存。HTTP 监听地址变更需重启服务才能生效。');
-    } else {
-      toast('配置已保存并生效');
-    }
+    toast(r.restart_required ? '已保存。HTTP 监听地址变更需重启服务才能生效。' : '配置已保存并生效');
   } catch (e) {
-    toast('保存失败: ' + e.message, true);
+    if (e.message !== 'unauthorized') toast('保存失败: ' + e.message, true);
   }
 });
 
@@ -435,7 +746,7 @@ $('c-retention').addEventListener('click', async () => {
     const r = await api('/api/maintenance/retention', { method: 'POST' });
     toast('清理完成，删除 ' + r.deleted + ' 条记录');
   } catch (e) {
-    toast('清理失败: ' + e.message, true);
+    if (e.message !== 'unauthorized') toast('清理失败: ' + e.message, true);
   } finally {
     $('c-retention').disabled = false;
   }
@@ -443,12 +754,17 @@ $('c-retention').addEventListener('click', async () => {
 
 /* ---------------- init & timers ---------------- */
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { refreshLive(); refreshDash(); }
+  if (!document.hidden && ME) { refreshLive(); refreshDash(); }
 });
 
-refreshLive();
-refreshDash();
-runQuery();
+// auth gates everything
+setupAuth().then(() => {
+  refreshLive();
+  refreshDash();
+  refreshDevices();
+  runQuery();
+});
+
 // auto refresh: dashboard 10s, live 5s, system view when visible
-setInterval(() => { if (!document.hidden) refreshLive(); }, 5000);
-setInterval(() => { if (!document.hidden && $('view-dash').classList.contains('active')) refreshDash(); }, 10000);
+setInterval(() => { if (!document.hidden && ME) refreshLive(); }, 5000);
+setInterval(() => { if (!document.hidden && ME && $('view-dash').classList.contains('active')) refreshDash(); }, 10000);

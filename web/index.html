@@ -9,6 +9,23 @@
 </head>
 <body>
 
+<!-- 登录覆盖层 -->
+<div class="login-bg" id="login-bg">
+  <div class="login-card">
+    <div class="brand" style="margin-bottom:18px;"><span class="dot"></span><b>palog</b></div>
+    <h1>日志审计控制台</h1>
+    <p class="sub">请使用管理员分配给你的账号登录</p>
+    <form id="login-form" autocomplete="on">
+      <label for="li-user">用户名</label>
+      <input id="li-user" name="username" autocomplete="username" placeholder="用户名" required autofocus>
+      <label for="li-pass">密码</label>
+      <input id="li-pass" name="password" type="password" autocomplete="current-password" placeholder="密码" required>
+      <button class="btn primary" type="submit" id="li-btn">登 录</button>
+    </form>
+    <div class="login-err" id="login-err"></div>
+  </div>
+</div>
+
 <header>
   <div class="brand"><span class="dot"></span><b>palog</b><small>Panabit 日志审计</small></div>
   <nav class="tabs">
@@ -19,13 +36,19 @@
   <div class="header-right">
     <span class="live" id="live-dot">实时</span>
     <span id="live-stats" class="mono" title="包数 / 记录数 / 解析错误">-</span>
+    <span class="who" id="whoami" title="">-</span>
+    <button class="btn sm" id="btn-logout" title="退出登录">退出</button>
   </div>
 </header>
 
 <main>
   <!-- ======================= 仪表盘 ======================= -->
   <section class="view active" id="view-dash">
-    <h2>仪表盘</h2>
+    <h2>仪表盘
+      <select id="d-device" class="inline-select" title="按设备查看（留空 = 所有可访问设备）">
+        <option value="">全部设备</option>
+      </select>
+    </h2>
     <div class="grid g-stats" id="stat-cards">
       <div class="card stat"><div class="lbl">日志总数</div><div class="num" id="s-total">-</div></div>
       <div class="card stat"><div class="lbl">最近 1 小时</div><div class="num" id="s-hour">-</div></div>
@@ -48,6 +71,10 @@
       </div>
     </div>
     <div class="card" style="margin-top:14px;">
+      <h3>设备分布</h3>
+      <div id="s-devices"></div>
+    </div>
+    <div class="card" style="margin-top:14px;">
       <h3>最近 24 小时趋势</h3>
       <div id="s-hourly"></div>
     </div>
@@ -55,7 +82,7 @@
       <h3>最近记录</h3>
       <div class="tbl-wrap"><table>
         <thead><tr>
-          <th>时间</th><th>类型</th><th>源</th><th>目的</th>
+          <th>时间</th><th>设备</th><th>类型</th><th>源</th><th>目的</th>
           <th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>字节</th>
         </tr></thead>
         <tbody id="s-recent"></tbody>
@@ -68,6 +95,9 @@
   <section class="view" id="view-logs">
     <h2>日志查询</h2>
     <div class="toolbar">
+      <select id="f-device" title="设备">
+        <option value="">全部设备</option>
+      </select>
       <select id="f-kind" title="类型">
         <option value="">全部类型</option>
         <option value="dnsquery">DNS 查询</option>
@@ -89,7 +119,7 @@
     </div>
     <div class="tbl-wrap"><table>
       <thead><tr>
-        <th>时间</th><th>类型</th><th>来源</th><th>目的</th><th>协议</th>
+        <th>时间</th><th>设备</th><th>类型</th><th>来源</th><th>目的</th><th>协议</th>
         <th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>流入/流出</th>
       </tr></thead>
       <tbody id="l-body"></tbody>
@@ -107,21 +137,14 @@
   <!-- ======================= 系统管理 ======================= -->
   <section class="view" id="view-sys">
     <h2>系统管理</h2>
-    <div class="grid g-2">
-      <div class="card">
-        <h3>服务配置</h3>
-        <div class="config-form" id="cfg-form">
-          <label>UDP 监听地址</label><input id="c-udp" title="格式 :端口 或 IP:端口">
-          <label>HTTP 监听地址</label><input id="c-http" title="变更需重启服务">
-          <label>数据保留(天)</label><input id="c-keep" type="number" min="1" max="3650">
-          <label>数据库路径</label><span class="ro" id="c-db"></span>
-        </div>
-        <div style="margin-top:16px; display:flex; gap:8px;">
-          <button class="btn primary" id="c-save">保存配置</button>
-          <button class="btn warn" id="c-retention">立即执行保留期清理</button>
-        </div>
-        <div class="faint" style="margin-top:10px; font-size:11.5px;" id="c-note"></div>
-      </div>
+    <nav class="subtabs" id="sys-tabs">
+      <button data-sub="stat">运行状态</button>
+      <button data-sub="devices" class="admin-only">设备管理</button>
+      <button data-sub="users" class="admin-only">用户管理</button>
+      <button data-sub="config" class="admin-only">服务配置</button>
+    </nav>
+
+    <div class="subview active" id="sys-stat">
       <div class="card">
         <h3>运行状态</h3>
         <div class="live" id="h-live" style="margin-bottom:12px;">服务运行中</div>
@@ -131,8 +154,66 @@
           <div class="cell"><b>-</b><span>已存记录</span></div>
           <div class="cell"><b>-</b><span>解析错误</span></div>
         </div>
-        <div style="margin-top:14px; font-size:12px; color:var(--text-dim);">
-          查看器: <span id="h-addr" class="mono">-</span>
+        <div style="margin-top:14px; font-size:12px;" class="faint">
+          监听设备: <span id="h-listeners" class="mono" style="color:var(--text-dim);">-</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="subview" id="sys-devices">
+      <div class="card">
+        <h3>设备管理 <span class="faint" style="text-transform:none;">(每台 Panabit 对应一个 UDP 端口)</span></h3>
+        <div class="toolbar">
+          <input id="dv-name" placeholder="设备名称, 如 panabit-办公" style="width:190px;">
+          <input id="dv-port" type="number" min="1" max="65535" placeholder="UDP 端口" style="width:120px;">
+          <label class="chk"><input type="checkbox" id="dv-enabled" checked> 启用</label>
+          <button class="btn primary" id="dv-add">添加 / 更新设备</button>
+          <span class="spacer"></span>
+          <span class="faint" id="dv-hint"></span>
+        </div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>ID</th><th>名称</th><th>端口</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="dv-body"></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="subview" id="sys-users">
+      <div class="card">
+        <h3>用户管理 <span class="faint" style="text-transform:none;">(用户只能查看被授权设备; admin 不受限)</span></h3>
+        <div class="toolbar">
+          <input id="us-name" placeholder="用户名" style="width:150px;">
+          <input id="us-pass" type="password" placeholder="密码(仅创建时填写)" style="width:170px;">
+          <select id="us-role">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+          <input id="us-devices" placeholder="可访问设备, 逗号分隔; * = 全部" style="width:260px;">
+          <button class="btn primary" id="us-add">创建用户</button>
+          <span class="spacer"></span>
+          <span class="faint">admin 的 devices 固定为 *</span>
+        </div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>可访问设备</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody id="us-body"></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="subview" id="sys-config">
+      <div class="grid g-2">
+        <div class="card">
+          <h3>服务配置</h3>
+          <div class="config-form" id="cfg-form">
+            <label>HTTP 监听地址</label><input id="c-http" title="变更需重启服务">
+            <label>数据保留(天)</label><input id="c-keep" type="number" min="1" max="3650">
+            <label>数据库路径</label><span class="ro" id="c-db"></span>
+          </div>
+          <div style="margin-top:16px; display:flex; gap:8px;">
+            <button class="btn primary" id="c-save">保存配置</button>
+            <button class="btn warn" id="c-retention">立即执行保留期清理</button>
+          </div>
+          <div class="faint" style="margin-top:10px; font-size:11.5px;">提示: UDP 监听端口在「设备管理」中按设备配置。</div>
         </div>
       </div>
     </div>

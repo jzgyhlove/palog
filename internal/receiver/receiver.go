@@ -1,5 +1,7 @@
-// Package receiver listens for Panabit PNB logs over UDP, parses them, and
-// hands normalized entries to the store.
+// Package receiver listens for Panabit PNB logs over UDP — one listener per
+// configured device/port — parses them, and hands normalized entries to the
+// store. Device changes (add/rename/report/disable) are reconciled every
+// second from the device registry.
 package receiver
 
 import (
@@ -7,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,158 +24,194 @@ const (
 	batchEvery = 200 * time.Millisecond
 )
 
-// Receiver owns the UDP socket, the parse pipeline and the batch writer.
+// Listener is one live UDP device listener (for the health endpoint).
+type Listener struct {
+	Device string `json:"device"`
+	Port   int    `json:"port"`
+	Addr   string `json:"addr"`
+	Active bool   `json:"active"`
+}
+
+// Receiver owns the per-device UDP sockets, the parse pipeline and the batch
+// writer. Device registry comes from the store; Run reconciles every second.
 type Receiver struct {
-	store   *store.Store
-	newAddr string // address to (re)bind on next rebuild pass
-	conn    net.PacketConn
-	ch      chan []store.Entry
+	store *store.Store
+	ch    chan []store.Entry
 
 	Packets     int64
 	Records     int64
 	ParseErrors int64
 	Dropped     int64
 
-	mu   sync.Mutex
-	done bool
+	mu        sync.Mutex
+	listeners map[string]*deviceListener // keyed by device name
 
 	doneCh chan struct{}
 }
 
-// New creates a Receiver bound to newAddr. Call Run to start, SetAddr to hot-rebind.
-func New(s *store.Store, addr string, chSize int) *Receiver {
+// deviceListener is one named UDP socket.
+type deviceListener struct {
+	dev    store.Device
+	conn   net.PacketConn
+	cancel chan struct{}
+	once   sync.Once
+	wg     sync.WaitGroup
+}
+
+// New creates a Receiver with a batch channel of chSize.
+func New(s *store.Store, chSize int) *Receiver {
 	return &Receiver{
-		store:   s,
-		newAddr: addr,
-		ch:      make(chan []store.Entry, chSize),
-		doneCh:  make(chan struct{}),
+		store:     s,
+		ch:        make(chan []store.Entry, chSize),
+		listeners: map[string]*deviceListener{},
+		doneCh:    make(chan struct{}),
 	}
 }
 
 // Done is closed once Run has fully drained and returned.
 func (r *Receiver) Done() <-chan struct{} { return r.doneCh }
 
-// Addr returns the currently bound listen address.
-func (r *Receiver) Addr() string {
+// Listeners snapshots the current live listeners.
+func (r *Receiver) Listeners() []Listener {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.conn == nil {
-		return ""
+	out := make([]Listener, 0, len(r.listeners))
+	for _, dl := range r.listeners {
+		l := Listener{Device: dl.dev.Name, Port: dl.dev.Port, Active: true}
+		if dl.conn != nil {
+			l.Addr = dl.conn.LocalAddr().String()
+		}
+		out = append(out, l)
 	}
-	return r.conn.LocalAddr().String()
+	return out
 }
 
-// SetAddr requests a rebind to addr on the next rebuild pass.
-func (r *Receiver) SetAddr(addr string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.newAddr = addr
-}
-
-// addrEqual reports whether two listen addresses are semantically identical:
-// ":40200", "[::]:40200" and "0.0.0.0:40200" all count as the same wildcard.
-func addrEqual(a, b string) bool {
-	ua, errA := net.ResolveUDPAddr("udp", a)
-	ub, errB := net.ResolveUDPAddr("udp", b)
-	if errA != nil || errB != nil {
-		return a == b
-	}
-	ipEq := ua.IP.Equal(ub.IP)
-	if (ua.IP == nil || ua.IP.IsUnspecified()) && (ub.IP == nil || ub.IP.IsUnspecified()) {
-		ipEq = true
-	}
-	return ipEq && ua.Port == ub.Port
-}
-
-// Run blocks: it serves the UDP socket and the batch writer until ctx is done.
-// The socket is rebound automatically when SetAddr changed the requested address.
+// Run blocks until ctx is done, reconciling device listeners every second.
 func (r *Receiver) Run(ctx context.Context) error {
-	r.mu.Lock()
-	pc, err := net.ListenPacket("udp", r.newAddr)
-	if err != nil {
-		r.mu.Unlock()
-		return err
-	}
-	r.conn = pc
-	slog.Info("udp listening", "addr", pc.LocalAddr().String())
-	r.mu.Unlock()
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); r.writerLoop(ctx) }()
 
-	active := pc
-	wg.Add(1)
-	go func() { defer wg.Done(); r.readLoop(ctx, active) }()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	r.reconcile() // initial pass
 
 	for {
 		select {
 		case <-ctx.Done():
 			r.mu.Lock()
-			r.done = true
+			for _, dl := range r.listeners {
+				dl.close()
+			}
+			ls := make([]*deviceListener, 0, len(r.listeners))
+			for _, dl := range r.listeners {
+				ls = append(ls, dl)
+			}
+			r.listeners = map[string]*deviceListener{}
 			r.mu.Unlock()
-			pc.Close()
+			for _, dl := range ls {
+				dl.wg.Wait()
+			}
 			close(r.ch)
 			wg.Wait()
 			close(r.doneCh)
 			return nil
-		case <-time.After(time.Second):
+		case <-ticker.C:
+			r.reconcile()
 		}
-		r.mu.Lock()
-		want := r.newAddr
-		cur := r.conn
-		r.mu.Unlock()
-		if cur != nil && addrEqual(cur.LocalAddr().String(), want) {
-			continue
-		}
-		// Rebind: open new socket first, then swap so readers see the change.
-		npc, err := net.ListenPacket("udp", want)
-		if err != nil {
-			slog.Error("rebind udp", "addr", want, "err", err)
-			continue
-		}
-		r.mu.Lock()
-		old := r.conn
-		r.conn = npc
-		r.mu.Unlock()
-		if old != nil {
-			old.Close() // unblocks the old reader; it exits on conn mismatch
-		}
-		pc = npc
-		active = npc
-		slog.Info("udp re-listening", "addr", npc.LocalAddr().String())
-		wg.Add(1)
-		go func() { defer wg.Done(); r.readLoop(ctx, npc) }()
 	}
 }
 
-// readerLoop reads datagrams from conn until it is closed, replaced, or ctx ends.
-func (r *Receiver) readLoop(ctx context.Context, conn net.PacketConn) {
+// reconcile diffs desired devices (from the store) against live listeners.
+func (r *Receiver) reconcile() {
+	desired, err := r.store.ListEnabledDevices()
+	if err != nil {
+		slog.Error("reconcile devices", "err", err)
+		return
+	}
+	want := map[string]store.Device{}
+	for _, d := range desired {
+		want[d.Name] = d
+	}
+
+	r.mu.Lock()
+	// Stop listeners whose device was removed, disabled or re-pointed.
+	toStop := []*deviceListener{}
+	for name, dl := range r.listeners {
+		d, ok := want[name]
+		if !ok || d.Port != dl.dev.Port || d.ID != dl.dev.ID {
+			toStop = append(toStop, dl)
+			delete(r.listeners, name)
+		}
+	}
+	// Start missing listeners.
+	toStart := []store.Device{}
+	for _, d := range desired {
+		if _, ok := r.listeners[d.Name]; !ok {
+			toStart = append(toStart, d)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, dl := range toStop {
+		dl.close()
+		dl.wg.Wait()
+		slog.Info("udp stopped", "device", dl.dev.Name, "port", dl.dev.Port)
+	}
+	for _, d := range toStart {
+		r.startListener(d)
+	}
+}
+
+// startListener opens a socket for d and spawns its reader. Errors are logged;
+// the next reconcile retries.
+func (r *Receiver) startListener(d store.Device) {
+	pc, err := net.ListenPacket("udp", ":"+strconv.Itoa(d.Port))
+	if err != nil {
+		slog.Error("udp listen", "device", d.Name, "port", d.Port, "err", err)
+		return
+	}
+	dl := &deviceListener{
+		dev:    d,
+		conn:   pc,
+		cancel: make(chan struct{}),
+	}
+	r.mu.Lock()
+	r.listeners[d.Name] = dl
+	r.mu.Unlock()
+	dl.wg.Add(1)
+	go func() { defer dl.wg.Done(); r.readLoop(dl) }()
+	slog.Info("udp listening", "device", d.Name, "addr", pc.LocalAddr().String())
+}
+
+func (dl *deviceListener) close() {
+	dl.once.Do(func() { close(dl.cancel) })
+	if dl.conn != nil {
+		dl.conn.Close()
+	}
+}
+
+func (r *Receiver) readLoop(dl *deviceListener) {
 	buf := make([]byte, udpBufSize)
+	conn := dl.conn
 	for {
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			r.mu.Lock()
-			cur := r.conn
-			done := r.done
-			r.mu.Unlock()
-			if done || cur != conn {
-				return // replaced or shutting down; supervisor handles new reader
-			}
 			select {
-			case <-ctx.Done():
-				return
+			case <-dl.cancel:
+				return // expected shutdown
 			default:
 			}
-			slog.Error("udp read", "err", err)
+			// transient error; retry after a short pause (do not busy-loop)
+			slog.Error("udp read", "device", dl.dev.Name, "err", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		r.handlePacket(buf[:n])
+		r.handlePacket(dl.dev.Name, buf[:n])
 	}
 }
 
-func (r *Receiver) handlePacket(data []byte) {
+func (r *Receiver) handlePacket(device string, data []byte) {
 	if bytes.HasPrefix(data, []byte("PNB\x00")) {
 		recs, perr := parse.ParseBinary(data)
 		atomic.AddInt64(&r.Packets, 1)
@@ -185,6 +224,9 @@ func (r *Receiver) handlePacket(data []byte) {
 		entries := make([]store.Entry, 0, len(recs))
 		for _, rc := range recs {
 			entries = append(entries, entryFromRecord(rc))
+		}
+		for i := range entries {
+			entries[i].Device = device
 		}
 		atomic.AddInt64(&r.Records, int64(len(entries)))
 		r.enqueue(entries)
@@ -207,6 +249,9 @@ func (r *Receiver) handlePacket(data []byte) {
 		}
 		if len(entries) == 0 {
 			return
+		}
+		for i := range entries {
+			entries[i].Device = device
 		}
 		atomic.AddInt64(&r.Records, int64(len(entries)))
 		r.enqueue(entries)
@@ -266,7 +311,7 @@ func (r *Receiver) enqueue(entries []store.Entry) {
 // ---------------------------------------------------------------------------
 
 func entryFromRecord(rc parse.Record) store.Entry {
-	e := store.Entry{
+	return store.Entry{
 		RecvTS:   time.Now().Unix(),
 		Kind:     parse.KindSess,
 		TS:       int64(rc.TS1),
@@ -288,7 +333,6 @@ func entryFromRecord(rc parse.Record) store.Entry {
 		RecType:  int(rc.Type),
 		Extra:    rc.Extra,
 	}
-	return e
 }
 
 func entryFromText(tl parse.TextLog) store.Entry {
