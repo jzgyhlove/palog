@@ -287,6 +287,13 @@ func ParseBinary(buf []byte) ([]Record, error) {
 				rec.Sport = int(binary.BigEndian.Uint16(val[8:10]))
 				rec.Dport = int(binary.BigEndian.Uint16(val[10:12]))
 				rec.HasTuple = true
+			case t == 0x01 && ln == 36:
+				// IPv6: 16 src + 16 dst + 2 sport + 2 dport (big endian)
+				rec.Src = net.IP(val[0:16]).String()
+				rec.Dst = net.IP(val[16:32]).String()
+				rec.Sport = int(binary.BigEndian.Uint16(val[32:34]))
+				rec.Dport = int(binary.BigEndian.Uint16(val[34:36]))
+				rec.HasTuple = true
 			case t == 0x03:
 				rec.Domain = nulStr(val)
 			case t == 0x05 && ln == 16:
