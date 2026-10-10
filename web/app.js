@@ -30,7 +30,12 @@ function relTime(ts) {
 }
 
 function kindBadge(kind) {
-  const map = { dnsquery: ['dns', 'DNS'], http: ['http', 'HTTP'], session: ['sess', '会话'] };
+  const map = {
+    dnsquery: ['dns', 'DNS'],
+    http: ['http', 'HTTP'],
+    session: ['sess', '会话'],
+    qqlogin: ['qq', 'QQ登录']
+  };
   const m = map[kind] || ['', kind];
   return '<span class="badge ' + m[0] + '">' + esc(m[1]) + '</span>';
 }
@@ -312,7 +317,7 @@ function openDrawer(id) {
   });
 }
 async function renderDrawer(item) {
-  const m = { dnsquery: 'dns', http: 'http', session: 'sess' };
+  const m = { dnsquery: 'dns', http: 'http', session: 'sess', qqlogin: 'qq' };
   const b = m[item.kind] || '';
   $('d-kind').className = 'badge ' + b;
   $('d-kind').textContent = item.kind;
@@ -385,7 +390,7 @@ function renderHourly(hourly) {
 }
 
 function kindShare(byKind) {
-  const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话' };
+  const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话', qqlogin: 'QQ 登录' };
   const entries = Object.entries(byKind || {}).map(([k, v]) =>
     [names[k] || k, v]).sort((a, b) => b[1] - a[1]);
   const total = entries.reduce((s, e) => s + e[1], 0) || 1;
@@ -415,7 +420,7 @@ function devShare(byDevice) {
 }
 
 function recentRow(item) {
-  const target = item.kind === 'dnsquery' ? item.domain : item.host;
+  const target = item.kind === 'dnsquery' ? item.domain : item.kind === 'qqlogin' ? item.user : item.host;
   const path = item.kind === 'http' ? item.path : '';
   const id = item.id;
   return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
@@ -497,7 +502,8 @@ function buildQueryParams() {
 function logRow(item, idx) {
   const target = item.kind === 'dnsquery' ? item.domain
     : item.kind === 'http' ? item.host
-      : (item.domain || item.host || '');
+      : item.kind === 'qqlogin' ? item.user
+        : (item.domain || item.host || '');
   const path = item.kind === 'http' ? item.path : '';
   const id = item.id;
   return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
