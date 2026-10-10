@@ -277,6 +277,8 @@ func ParseBinary(buf []byte) ([]Record, error) {
 			ln := int(buf[off+1])
 			voff := off + 2
 			if voff+ln > len(buf) {
+				// 尾部 TLV 被截断：保留本条记录中已解析字段，停止继续解析该包。
+				recs = append(recs, rec)
 				return recs, fmt.Errorf("truncated TLV value at %d", off)
 			}
 			val := buf[voff : voff+ln]
