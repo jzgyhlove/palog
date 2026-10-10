@@ -789,12 +789,32 @@ func (s *Store) UpsertDevice(d Device) (Device, error) {
 		en = 1
 	}
 	if d.ID > 0 {
-		res, err := s.db.Exec("UPDATE devices SET name=?, port=?, enabled=? WHERE id=?", d.Name, d.Port, en, d.ID)
+		tx, err := s.db.Begin()
 		if err != nil {
 			return d, err
 		}
+		var oldName string
+		if err := tx.QueryRow("SELECT name FROM devices WHERE id=?", d.ID).Scan(&oldName); err != nil {
+			tx.Rollback()
+			return d, err
+		}
+		res, err := tx.Exec("UPDATE devices SET name=?, port=?, enabled=? WHERE id=?", d.Name, d.Port, en, d.ID)
+		if err != nil {
+			tx.Rollback()
+			return d, err
+		}
 		if n, _ := res.RowsAffected(); n == 0 {
+			tx.Rollback()
 			return d, fmt.Errorf("device %d not found", d.ID)
+		}
+		if oldName != d.Name {
+			if _, err := tx.Exec("UPDATE logs SET device=? WHERE device=?", d.Name, oldName); err != nil {
+				tx.Rollback()
+				return d, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return d, err
 		}
 	} else {
 		res, err := s.db.Exec("INSERT INTO devices(name, port, enabled) VALUES(?,?,?)", d.Name, d.Port, en)
