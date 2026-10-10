@@ -357,7 +357,12 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if lq.Offset, err = strconv.Atoi(q.Get("offset")); err != nil || lq.Offset < 0 {
 		lq.Offset = 0
 	}
-	if lq.From, err = parseTimeParam(q.Get("from"), 0); err != nil {
+	// Default the lower time bound to the last hour when the caller does not
+	// ask for one, so a bare /api/logs cannot trigger a full-table scan.
+	// Pass from=0 (or any explicit value) to override, e.g. to browse history.
+	if q.Get("from") == "" {
+		lq.From = time.Now().Add(-time.Hour).Unix()
+	} else if lq.From, err = parseTimeParam(q.Get("from"), 0); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

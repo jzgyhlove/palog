@@ -233,6 +233,14 @@ function fromDTLocal(v) {
   return isNaN(t) ? 0 : Math.floor(t / 1000);
 }
 
+/* 日志查询默认时间窗:最近 1 小时(至 = 现在,向上取整到分钟以覆盖当前分钟) */
+function defaultLogWindow() {
+  const now = Math.floor(Date.now() / 1000);
+  const to = Math.ceil(now / 60) * 60;
+  $('f-from').value = toDTLocal(now - 3600);
+  $('f-to').value = toDTLocal(to);
+}
+
 /* ---------------- device filter ---------------- */
 let DEVICES = []; // visible devices (server already scoped by role)
 
@@ -255,6 +263,14 @@ function switchView(name) {
   document.querySelectorAll('.view').forEach(v => {
     v.classList.toggle('active', v.id === 'view-' + name);
   });
+  if (name === 'logs') {
+    // 打开日志查询页时:若未显式设置过时间窗,默认最近 1 小时并自动加载
+    if (!queryState.timeSet) {
+      defaultLogWindow();
+      queryState.timeSet = true;
+    }
+    runQuery();
+  }
   if (name === 'sys') refreshSys();
 }
 document.querySelectorAll('nav.tabs button').forEach(b =>
@@ -460,7 +476,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ---------------- log query ---------------- */
-const queryState = { limit: 100, offset: 0 };
+const queryState = { limit: 100, offset: 0, timeSet: false };
 
 function buildQueryParams() {
   const p = new URLSearchParams();
@@ -545,11 +561,12 @@ $('l-next').addEventListener('click', () => {
   runQuery();
 });
 $('f-reset').addEventListener('click', () => {
-  ['f-device', 'f-kind', 'f-q', 'f-src', 'f-dst', 'f-domain', 'f-from', 'f-to', 'f-order'].forEach(id => {
+  ['f-device', 'f-kind', 'f-q', 'f-src', 'f-dst', 'f-domain', 'f-order'].forEach(id => {
     if (id === 'f-kind' || id === 'f-order') $(id).value = id === 'f-kind' ? '' : 'desc';
-    else if (id === 'f-from' || id === 'f-to') $(id).value = '';
     else $(id).value = '';
   });
+  // 时间窗重置回默认最近 1 小时(而非清空 → 避免触发全表查询)
+  defaultLogWindow();
   queryState.offset = 0;
   runQuery();
 });
@@ -813,6 +830,9 @@ setupAuth().then(() => {
   refreshLive();
   refreshDash();
   refreshDevices();
+  // 日志查询默认最近 1 小时,避免启动即全表查询
+  defaultLogWindow();
+  queryState.timeSet = true;
   runQuery();
 });
 

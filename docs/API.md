@@ -127,7 +127,7 @@ Body:`{"username":"admin","password":"..."}`。
 ```
 
 #### GET /api/logs
-Query 参数:`device`、`kind`、`q`(跨 src_ip/dst_ip/domain/host/path/user 模糊)、`src_ip`、`dst_ip`、`domain`、`from`(Unix 秒或 RFC3339)、`to`、`limit`(默认 100,最大 1000)、`offset`、`order`(`asc`|`desc`,默认 desc)。
+Query 参数:`device`、`kind`、`q`(跨 src_ip/dst_ip/domain/host/path/user 模糊)、`src_ip`、`dst_ip`、`domain`、`from`(Unix 秒或 RFC3339;**缺省 = 最近 1 小时前**,显式 `from=0` 表示不设下限)、`to`、`limit`(默认 100,最大 1000)、`offset`、`order`(`asc`|`desc`,默认 desc)。
 普通用户查询强制收敛到其 `devices` 白名单;显式传越权 `device` → `403`。
 响应:
 ```json

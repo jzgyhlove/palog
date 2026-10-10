@@ -236,6 +236,37 @@ func TestUserScopeIsolation(t *testing.T) {
 	}
 }
 
+func TestLogsDefaultWindow(t *testing.T) {
+	ts, st := newTestServer(t)
+	atok, _ := login(t, ts, "admin", "adminpw")
+
+	// seed an old row (2h ago) alongside the recent seeds
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	if err := st.InsertBatch([]store.Entry{
+		{Device: "fw-1", Kind: "dnsquery", TS: old, RecvTS: old, SrcIP: "10.0.0.9", DstIP: "8.8.8.8", DstPort: 53, Proto: 17, Domain: "old.fw1.test"},
+	}); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+
+	// bare /api/logs: default window = last 1h -> old row excluded
+	logs := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/logs", atok, nil))
+	if n := int(logs["total"].(float64)); n != 3 {
+		t.Fatalf("default window total = %d, want 3 (old row excluded)", n)
+	}
+	for _, it := range logs["items"].([]any) {
+		m := it.(map[string]any)
+		if m["domain"] == "old.fw1.test" {
+			t.Fatalf("old row leaked into default window: %v", m)
+		}
+	}
+
+	// explicit from=0 -> no lower bound, old row visible again
+	logsAll := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/logs?from=0", atok, nil))
+	if n := int(logsAll["total"].(float64)); n != 4 {
+		t.Fatalf("from=0 total = %d, want 4", n)
+	}
+}
+
 func TestAdminEndpoints(t *testing.T) {
 	ts, _ := newTestServer(t)
 	utok, _ := login(t, ts, "user1", "userpw")
