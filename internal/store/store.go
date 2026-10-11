@@ -630,95 +630,25 @@ const statsWindow = 1 * time.Hour
 
 // Stats aggregates dashboard data. devices limits scope (nil = all).
 //
-// Cost: every aggregate except the 24h hourly trend is bounded to the
-// trailing hour (statsWindow) via idx_logs_ts, so the call stays an
-// index-bounded set of cheap queries on large tables. The UI only consumes
-// Hourly from this endpoint (the 24h trend sparkline); all other dashboard
-// numbers come from /api/official-stats, which carries its own cheap/full
-// cost split.
+// The UI only consumes Hourly (the 24h trend sparkline, shown when the user
+// picks a 24h/all window) and the in-memory counters from this endpoint; every
+// other dashboard number comes from /api/official-stats. It therefore computes
+// only the 24h hourly bucket GROUP BY (ts-index-bounded) plus Total/LastHour
+// counts — no top values, by_kind, by_device or recent-row scans, so the call
+// stays cheap even when only used for the trend chart.
 func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stats, error) {
 	st := &Stats{
 		Packets:     c.Packets,
 		Records:     c.Records,
 		ParseErrors: c.ParseErrors,
-		ByKind:      map[string]int64{},
-		ByDevice:    map[string]int64{},
 	}
 	if uptime.Seconds() > 0 {
 		st.PPS = float64(c.Packets) / uptime.Seconds()
 	}
 
-	from := time.Now().Add(-statsWindow).Unix()
 	scope, sargs := scopeCond(devices)
 
-	// baseWhere: the 1h ts guard plus optional device scope.
-	baseWhere := " WHERE ts >= ?"
-	baseArgs := []interface{}{from}
-	if scope != "" {
-		baseWhere += " AND " + scope
-		baseArgs = append(baseArgs, sargs...)
-	}
-
-	// Total + last hour share the same guard (window is 1h).
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
-		return nil, err
-	}
-	st.LastHour = st.Total
-
-	// ByKind (1h window).
-	rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var k string
-		var n int64
-		if err := rows.Scan(&k, &n); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		st.ByKind[k] = n
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// ByDevice (1h window, excluding empty device sentinel).
-	devWhere := baseWhere + " AND device != ''"
-	devArgs := baseArgs
-	rows, err = s.db.Query("SELECT device, COUNT(*) FROM logs"+devWhere+" GROUP BY device ORDER BY 2 DESC", devArgs...)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var d string
-		var n int64
-		if err := rows.Scan(&d, &n); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		st.ByDevice[d] = n
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if st.TopDomains, err = s.topValues("domain", 10, baseWhere, baseArgs); err != nil {
-		return nil, err
-	}
-	if st.TopSrcIP, err = s.topValues("src_ip", 10, baseWhere, baseArgs); err != nil {
-		return nil, err
-	}
-
-	if st.Devices, err = s.ListDevices(); err != nil {
-		return nil, err
-	}
-
 	// 24 contiguous hourly buckets ending at the current hour (UTC labels).
-	// The trend chart needs 24 buckets even though the other aggregates are
-	// 1h-bounded; the ts guard keeps this GROUP BY index-driven.
 	now := time.Now().UTC()
 	curHour := now.Truncate(time.Hour)
 	hWhere := " WHERE ts >= ?"
@@ -727,9 +657,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		hWhere += " AND " + scope
 		hArgs = append(hArgs, sargs...)
 	}
-	// The hourly buckets cover 24h regardless of statsWindow because the
-	// trend chart needs them; the idx_logs_ts composite covers this.
-	rows, err = s.db.Query("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
+	rows, err := s.db.Query("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -755,34 +683,23 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		})
 	}
 
-	// Recent: last 10 rows, ts-ordered, no full-table scan.
-	recentFrom := time.Now().Add(-time.Hour).Unix()
-	recentWhere := " WHERE ts >= ?"
-	recentArgs := []interface{}{recentFrom}
+	// Total + LastHour over the trailing hour (cheap ts-bounded count; kept
+	// for API compatibility with existing consumers).
+	from := time.Now().Add(-statsWindow).Unix()
+	baseWhere := " WHERE ts >= ?"
+	baseArgs := []interface{}{from}
 	if scope != "" {
-		recentWhere += " AND " + scope
-		recentArgs = append(recentArgs, sargs...)
+		baseWhere += " AND " + scope
+		baseArgs = append(baseArgs, sargs...)
 	}
-	recentRows, err := s.db.Query(
-		"SELECT "+logCols+" FROM logs"+recentWhere+
-			" ORDER BY ts DESC, id DESC LIMIT 10", recentArgs...)
-	if err != nil {
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
 		return nil, err
 	}
-	recentItems := make([]Entry, 0, 10)
-	for recentRows.Next() {
-		e, err := scanEntry(recentRows.Scan)
-		if err != nil {
-			recentRows.Close()
-			return nil, err
-		}
-		recentItems = append(recentItems, e)
-	}
-	recentRows.Close()
-	if err := recentRows.Err(); err != nil {
+	st.LastHour = st.Total
+
+	if st.Devices, err = s.ListDevices(); err != nil {
 		return nil, err
 	}
-	st.Recent = recentItems
 	return st, nil
 }
 
@@ -939,21 +856,27 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			}
 		}
 
-		out.Traffic.ByKind = map[string]int64{}
-		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var k string
-			var n int64
-			if err := rows.Scan(&k, &n); err != nil {
+		// by_kind is a GROUP BY over the whole window — only worth paying for
+		// when the caller explicitly asked for rankings or full deep-dive.
+		// The cheap 系统概况 auto-refresh skips it to stay index-only.
+		if rank || full {
+			out.Traffic.ByKind = map[string]int64{}
+			rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
+			if err != nil {
 				return err
 			}
-			out.Traffic.ByKind[k] = n
+			defer rows.Close()
+			for rows.Next() {
+				var k string
+				var n int64
+				if err := rows.Scan(&k, &n); err != nil {
+					return err
+				}
+				out.Traffic.ByKind[k] = n
+			}
+			return rows.Err()
 		}
-		return rows.Err()
+		return nil
 	}
 	if err := traffic(); err != nil {
 		return nil, err
@@ -1148,19 +1071,26 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 }
 
 // Warmup primes the SQLite page cache so the first user request does not pay
-// the cold-cache cost of scanning the large index/tree pages. It touches the
-// same index-bounded scans the dashboard runs (trailing-1h count, trailing-
-// 24h hourly bucket, top-domain/top-src aggregates) and drives every logs
-// index so its tree pages are cached.
+// the cold-cache cost of scanning the large index/tree pages. It runs the
+// exact aggregate queries the default dashboard paths execute:
+//  - the cheap official-stats COUNT+SUM scan over the trailing hour
+//  - the Stats() 24h hourly-bucket GROUP BY
+//  - the top-domain / top-src_ip probes used by full/rank deep-dives
+// and drives every logs index so its tree pages are cached.
 func (s *Store) Warmup() error {
 	now := time.Now()
 	hour := now.Add(-time.Hour).Unix()
 	day := now.Add(-24 * time.Hour).Unix()
-	var n int64
+	var total, bytesIn, bytesOut int64
 	if err := s.db.QueryRow(
-		"SELECT COUNT(*) FROM logs WHERE ts >= ?", hour).Scan(&n); err != nil {
+		"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= ?",
+		hour).Scan(&total, &bytesIn, &bytesOut); err != nil {
 		return err
 	}
+	_ = total
+	_ = bytesIn
+	_ = bytesOut
+	// 24h hourly buckets (Stats trend sparkline).
 	rows, err := s.db.Query(
 		"SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= ? GROUP BY h", day)
 	if err != nil {
@@ -1183,7 +1113,7 @@ func (s *Store) Warmup() error {
 	for _, col := range []string{"domain", "src_ip"} {
 		if err := s.db.QueryRow(
 			"SELECT COUNT(*) FROM (SELECT "+col+" FROM logs WHERE ts >= ? AND "+col+" != '' GROUP BY "+col+" ORDER BY COUNT(*) DESC LIMIT 10)",
-			hour).Scan(&n); err != nil {
+			hour).Scan(&total); err != nil {
 			return err
 		}
 	}
@@ -1197,7 +1127,7 @@ func (s *Store) Warmup() error {
 		"SELECT COUNT(*) FROM logs WHERE appid = 0",
 	}
 	for _, p := range probes {
-		if err := s.db.QueryRow(p).Scan(&n); err != nil {
+		if err := s.db.QueryRow(p).Scan(&total); err != nil {
 			return err
 		}
 	}

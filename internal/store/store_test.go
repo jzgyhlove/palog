@@ -163,17 +163,8 @@ func TestStats(t *testing.T) {
 	if st.Total != 3 || st.Packets != 100 || st.ParseErrors != 1 {
 		t.Errorf("basic stats wrong: %+v", st)
 	}
-	if st.ByKind["dnsquery"] != 1 || st.ByKind["http"] != 1 || st.ByKind["session"] != 1 {
-		t.Errorf("by_kind wrong: %v", st.ByKind)
-	}
-	if len(st.TopDomains) == 0 || st.TopDomains[0].Value != "edr.syslog.top" {
-		t.Errorf("top domains wrong: %v", st.TopDomains)
-	}
 	if len(st.Hourly) != 24 {
 		t.Errorf("hourly buckets=%d, want 24", len(st.Hourly))
-	}
-	if len(st.Recent) != 3 {
-		t.Errorf("recent=%d, want 3", len(st.Recent))
 	}
 }
 
@@ -446,18 +437,10 @@ func TestDeviceScopedQuery(t *testing.T) {
 	if st.Total != 1 {
 		t.Fatalf("stats scope total=%d, want 1", st.Total)
 	}
-	if st.ByDevice["fw-1"] != 1 || st.ByDevice["fw-2"] != 0 {
-		t.Fatalf("by_device wrong: %v", st.ByDevice)
-	}
 	// unrestricted stats see both devices
 	st, _ = s.Stats(Counters{Records: 2}, time.Hour, nil)
-	if st.Total != 2 || st.ByDevice["fw-2"] != 1 {
-		t.Fatalf("unrestricted stats: total=%d by_device=%v", st.Total, st.ByDevice)
-	}
-	// recent rows are scoped too
-	st, _ = s.Stats(Counters{Records: 2}, time.Hour, []string{"fw-2"})
-	if len(st.Recent) != 1 || st.Recent[0].Device != "fw-2" {
-		t.Fatalf("scoped recent: %+v", st.Recent)
+	if st.Total != 2 {
+		t.Fatalf("unrestricted stats: total=%d, want 2", st.Total)
 	}
 }
 
@@ -579,6 +562,11 @@ func TestOfficialStats(t *testing.T) {
 		len(def.ByDevice) != 0 || len(def.Recent) != 0 {
 		t.Fatalf("cheap path must skip overview extras: %+v", def)
 	}
+	// by_kind is a GROUP BY — only computed for rank/full, never on the
+	// cheap auto-refresh path.
+	if len(def.Traffic.ByKind) != 0 {
+		t.Fatalf("cheap path must skip by_kind: %+v", def.Traffic.ByKind)
+	}
 	// Security.LastHour mirrors the traffic trailing-hour total.
 	if def.Security.LastHour != 2 {
 		t.Fatalf("security last hour=%d, want 2", def.Security.LastHour)
@@ -621,6 +609,11 @@ func TestOfficialStats(t *testing.T) {
 		len(custom.ByDevice) != 0 || len(custom.Recent) != 0 {
 		t.Fatalf("window call without full must skip extras: %+v", custom)
 	}
+	// rank path computes by_kind (GROUP BY only paid for on rank/full).
+	// Both devEntries rows share kind "dnsquery" → one map entry, count 2.
+	if len(custom.Traffic.ByKind) != 1 || custom.Traffic.ByKind["dnsquery"] != 2 {
+		t.Fatalf("rank path must compute by_kind: %+v", custom.Traffic.ByKind)
+	}
 	if custom.Traffic.LastHour != custom.Traffic.TotalRecords {
 		t.Fatalf("window last_hour=%d total=%d, want equal",
 			custom.Traffic.LastHour, custom.Traffic.TotalRecords)
@@ -646,6 +639,9 @@ func TestOfficialStats(t *testing.T) {
 	}
 	if len(fullDef.IPRanking) == 0 {
 		t.Fatalf("full default must compute ip ranking")
+	}
+	if len(fullDef.Traffic.ByKind) == 0 {
+		t.Fatalf("full default must compute by_kind")
 	}
 
 	// Out-of-range window: counts fall back to 0, no full-table scan.

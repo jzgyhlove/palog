@@ -184,9 +184,9 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("seed session rows: %v", err)
 	}
 
-	// admin: cheap default (系统概况 auto-refresh path) — aggregates are
-	// bounded to the trailing hour; rankings and extras absent so the
-	// auto-refresh call cannot scan or group large row sets.
+	// admin: cheap default (系统概况 auto-refresh path) — only the ts-bounded
+	// COUNT+SUM runs; no GROUP BY of any kind, no rankings, no extras, so
+	// the 10 s auto-refresh stays cheap on a large trailing-hour row set.
 	r := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats", atok, nil))
 	traffic := r["traffic"].(map[string]any)
 	if traffic["total_records"].(float64) < 5 {
@@ -196,6 +196,10 @@ func TestOfficialStats(t *testing.T) {
 	if traffic["bytes_in"].(float64) < 6000 {
 		t.Fatalf("traffic.bytes_in = %v, want >= 6000", traffic["bytes_in"])
 	}
+	// cheap default skips by_kind (GROUP BY is paid only on rank/full).
+	if bk, ok := traffic["by_kind"].(map[string]any); ok && len(bk) != 0 {
+		t.Fatalf("cheap default must skip by_kind: %v", bk)
+	}
 	if ipr, ok := r["ip_ranking"].([]any); ok && len(ipr) != 0 {
 		t.Fatalf("cheap default must skip ip_ranking: %v", r["ip_ranking"])
 	}
@@ -203,8 +207,12 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("cheap default must skip app_ranking: %v", r["app_ranking"])
 	}
 
-	// admin: rank deep-dive (?rank=1) — rankings present, extras absent.
+	// admin: rank deep-dive (?rank=1) — by_kind + rankings present, extras
+	// absent (bounded to the trailing hour without an explicit window).
 	rr := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats?rank=1", atok, nil))
+	if rrBK, ok := rr["traffic"].(map[string]any)["by_kind"].(map[string]any); !ok || len(rrBK) == 0 {
+		t.Fatalf("?rank=1 must compute by_kind: %v", rr["traffic"])
+	}
 	if rrIPs, ok := rr["ip_ranking"].([]any); !ok || len(rrIPs) == 0 {
 		t.Fatalf("?rank=1 must compute ip_ranking: %v", rr["ip_ranking"])
 	}
