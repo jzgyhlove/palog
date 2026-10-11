@@ -73,6 +73,40 @@ function devBadge(name) {
   return '<span class="badge dev">' + esc(name) + '</span>';
 }
 
+// appid → appname mapping, mirroring store.AppNames in
+// internal/store/store.go (the official Panabit app-name table).
+const APP_NAME_MAP = {
+  0: 'Other',
+  1: 'TCP',
+  2: 'UDP',
+  5: 'DNS',
+  6: 'SSH',
+  10: 'NTP',
+  16: 'ICMP',
+  20: 'HTTPS',
+  23: 'SMTP',
+  26: 'Telnet',
+  186: 'HTTP',
+  384: 'Bittorrent',
+  446: 'Skype',
+  454: 'P2P',
+  559: 'FTP',
+  637: 'POP3',
+  714: 'HTTP-Alt',
+  839: 'IM',
+};
+function appNameOf(appid) {
+  if (appid == null || appid < 0) return '';
+  return APP_NAME_MAP[appid] || '';
+}
+
+function appidBadge(appid) {
+  if (appid == null || appid < 0) return '<span class="faint">-</span>';
+  const name = appNameOf(appid);
+  const label = name ? name + ' (' + appid + ')' : String(appid);
+  return '<span class="badge appid" title="' + esc(String(appid)) + '">' + esc(label) + '</span>';
+}
+
 /* toasts */
 function toast(msg, isErr) {
   const el = document.createElement('div');
@@ -434,7 +468,7 @@ function recentRow(item) {
     '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
     '<td class="mono trunc">' + esc(target || '') + '</td>' +
     '<td class="mono trunc">' + esc(path || '') + '</td>' +
-    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
     '</tr>';
 }
@@ -518,7 +552,7 @@ function logRow(item, idx) {
     '<td>' + protoBadge(item.proto) + '</td>' +
     '<td class="mono trunc">' + esc(target || '') + '</td>' +
     '<td class="mono trunc wide">' + esc(path || '') + '</td>' +
-    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
     '</tr>';
 }
@@ -1020,7 +1054,7 @@ function auditSessionRow(item) {
     '<td>' + protoBadge(item.proto) + '</td>' +
     '<td class="mono trunc">' + esc(target) + '</td>' +
     '<td class="mono trunc wide">' + esc(path) + '</td>' +
-    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
     '</tr>';
 }
@@ -1035,7 +1069,7 @@ function auditUrlRow(item) {
     '<td class="mono">' + esc(item.method || '-') + '</td>' +
     '<td class="mono trunc">' + esc(item.host || '') + '</td>' +
     '<td class="mono trunc wide">' + esc(item.path || '') + '</td>' +
-    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + esc(item.user || '-') + '</td>' +
     '</tr>';
 }
@@ -1126,13 +1160,19 @@ function renderAppRanking(items) {
   const body = $('an-apprank-body');
   const empty = $('an-apprank-empty');
   empty.style.display = items.length ? 'none' : 'block';
-  body.innerHTML = items.map((v, i) =>
-    '<tr>' +
+  body.innerHTML = items.map((v, i) => {
+    // The backend resolves the value to the app name (store.AppNames);
+    // unmapped ids come back as the raw numeric id.
+    const label = String(v.value);
+    const n = parseInt(label, 10);
+    const name = isNaN(n) ? '' : appNameOf(n);
+    const shown = name && label !== name ? name + ' (' + label + ')' : label;
+    return '<tr>' +
     '<td class="faint">' + (i + 1) + '</td>' +
-    '<td><span class="badge appid">' + esc(v.value) + '</span></td>' +
+    '<td><span class="badge appid" title="' + esc(label) + '">' + esc(shown) + '</span></td>' +
     '<td class="mono">' + fmtNum(v.count) + '</td>' +
-    '</tr>'
-  ).join('');
+    '</tr>';
+  }).join('');
 }
 
 /* ---------------- init & timers ---------------- */

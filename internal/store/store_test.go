@@ -537,3 +537,19 @@ func TestMigrateLegacyDB(t *testing.T) {
 		t.Fatalf("http_addr = %q, want :9999", httpAddr)
 	}
 }
+
+func TestAppNameOf(t *testing.T) {
+	if got := AppNameOf(23); got != "SMTP" {
+		t.Errorf("AppNameOf(23) = %q, want SMTP", got)
+	}
+	if got := AppNameOf(714); got != "HTTP-Alt" {
+		t.Errorf("AppNameOf(714) = %q, want HTTP-Alt", got)
+	}
+	// unknown ids map to nothing (UI falls back to the raw id)
+	if got := AppNameOf(42); got != "" {
+		t.Errorf("AppNameOf(42) = %q, want empty", got)
+	}
+	if got := AppNameOf(-1); got != "" {
+		t.Errorf("AppNameOf(-1) = %q, want empty", got)
+	}
+}

@@ -177,6 +177,9 @@ func TestOfficialStats(t *testing.T) {
 		{Device: "fw-1", Kind: "session", TS: now, RecvTS: now,
 			SrcIP: "10.0.0.2", DstIP: "2.2.2.2", Proto: 6, Appid: 42,
 			BytesIn: 5000, BytesOut: 6000},
+		{Device: "fw-1", Kind: "session", TS: now, RecvTS: now,
+			SrcIP: "10.0.0.3", DstIP: "3.3.3.3", Proto: 6, Appid: 23,
+			BytesIn: 100, BytesOut: 200},
 	}); err != nil {
 		t.Fatalf("seed session rows: %v", err)
 	}
@@ -204,27 +207,34 @@ func TestOfficialStats(t *testing.T) {
 	if !found {
 		t.Fatalf("ip_ranking missing 10.0.0.2: %v", ipRanking)
 	}
-	// app_ranking: appid 42 should appear
+	// app_ranking: appid 42 (unmapped) should appear as the raw id;
+	// appid 23 (mapped) should appear as its official name
 	appRanking := r["app_ranking"].([]any)
 	appFound := false
+	mappedFound := false
 	for _, av := range appRanking {
 		m := av.(map[string]any)
 		if m["value"] == "42" {
 			appFound = true
-			break
+		}
+		if m["value"] == "SMTP" {
+			mappedFound = true
 		}
 	}
 	if !appFound {
 		t.Fatalf("app_ranking missing appid 42: %v", appRanking)
+	}
+	if !mappedFound {
+		t.Fatalf("app_ranking missing mapped name for appid 23: %v", appRanking)
 	}
 
 	// scoped user (fw-1 only): fw-2 rows must be excluded
 	r2 := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats", utok, nil))
 	traffic2 := r2["traffic"].(map[string]any)
 	// fw-2 has one dnsquery row; scoped user should not see it in total_records
-	// total_records should reflect only fw-1 rows
-	if traffic2["total_records"].(float64) > 4 {
-		t.Fatalf("scoped total_records = %v, want <= 4 (fw-1 only)", traffic2["total_records"])
+	// total_records should reflect only fw-1 rows (3 seed + 3 session)
+	if traffic2["total_records"].(float64) > 6 {
+		t.Fatalf("scoped total_records = %v, want <= 6 (fw-1 only)", traffic2["total_records"])
 	}
 
 	// out-of-scope device -> 403

@@ -150,6 +150,40 @@ type User struct {
 // existed (single-socket deployments).
 const DefaultDevice = "panabit"
 
+// AppNames maps Panabit application IDs to the names the official Panabit
+// log system displays (the official UI renders `appname`, not the bare ID).
+// The full official list is not distributable, so this covers the commonly
+// observed IDs; unknown appids render as "App <id>" in the UI.
+var AppNames = map[int]string{
+	0:   "Other",
+	1:   "TCP",
+	2:   "UDP",
+	5:   "DNS",
+	6:   "SSH",
+	10:  "NTP",
+	16:  "ICMP",
+	186: "HTTP",
+	20:  "HTTPS",
+	23:  "SMTP",
+	26:  "Telnet",
+	384: "Bittorrent",
+	446: "Skype",
+	454: "P2P",
+	559: "FTP",
+	637: "POP3",
+	714: "HTTP-Alt",
+	839: "IM",
+}
+
+// AppNameOf returns the known name for an appid, or "" if the id is
+// unknown/invalid (the UI falls back to rendering the id).
+func AppNameOf(appid int) string {
+	if appid < 0 {
+		return ""
+	}
+	return AppNames[appid]
+}
+
 type Store struct {
 	db     *sql.DB
 	dbPath string
@@ -856,8 +890,12 @@ func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, err
 		if err := appRows.Scan(&appid, &n); err != nil {
 			return nil, err
 		}
+		name := AppNameOf(appid)
+		if name == "" {
+			name = strconv.Itoa(appid)
+		}
 		out.AppRanking = append(out.AppRanking, CountValue{
-			Value: strconv.Itoa(appid),
+			Value: name,
 			Count: n,
 		})
 	}
