@@ -471,23 +471,27 @@ async function refreshDash() {
     if (dev) op.set('device', dev);
     if (from) op.set('from', from);
     if (to) op.set('to', to);
-    // 系统概况 1h 查询慢的根因是 /api/stats 在 4G DB 上跑 24h 全量聚合。
-    // 现在 系统概况 只调 /api/official-stats（窗口内聚合）+ /api/health（实时计数），
-    // 不再走 24h 的 /api/stats。并发拉取，1h 窗口下体感很快。
+    // 系统概况 1h 查询慢的根因是 默认调用在大表上跑全量 GROUP BY。
+    // 现在 系统概况 默认只拉 cheap 聚合(流量汇总/by_kind/security)，
+    // 不跑排名与 top 列表；按需 ?full=1 才拉排名/域/IP/设备分布/最近记录。
+    // 默认 1h 走 cheap 路径(不跑排名/top/group-by)；用户勾选「详细统计」
+    // 或切到 24h/全部时间窗口时才传 full=1 让后端按需计算重聚合。
+    const full = (($('d-full') && $('d-full').checked) || (from && to - from >= 86400));
     const [o, h] = await Promise.all([
-      api('/api/official-stats?' + op.toString()),
+      api('/api/official-stats?' + op.toString() + (full ? '&full=1' : '')),
       api('/api/health'),
     ]);
     $('s-pps').innerHTML = (h.packets && h.uptime_sec ? (h.packets / h.uptime_sec).toFixed(2) : '0') + ' <small>包/秒</small>';
     $('s-pkts').innerHTML = fmtNum(h.packets) + ' / ' + fmtNum(h.records);
     $('s-errs').textContent = fmtNum(h.parse_errors);
     kindShare(o.traffic.by_kind);
+    // cheap 默认路径不带 top_domains/top_src_ip/recent — barList/表渲染需容错。
     barList($('s-domains'), o.top_domains);
     barList($('s-srcip'), o.top_src_ip);
     devShare(o.by_device);
-    // 24h 趋势图：official-stats 不带 hourly，仍用 /api/stats 的 hourly（慢，但仅趋势图）。
-    // 为避免 1h 概况也卡在这里，趋势图改为按需懒加载：仅当用户切到 24h 窗口时才查。
-    if (to - from >= 86400 || !from) {
+    // 24h 趋势图：official-stats 不带 hourly，仍用 /api/stats 的 hourly。
+    // 默认 1h cheap 路径下不查(避免重聚合)，仅当用户切到 24h/全部时间窗口时查。
+    if (from && to - from >= 86400) {
       try {
         const sp = new URLSearchParams();
         if (dev) sp.set('device', dev);
@@ -518,6 +522,7 @@ async function refreshDash() {
 
 $('d-device').addEventListener('change', refreshDash);
 ['d-from', 'd-to'].forEach(id => $(id).addEventListener('change', refreshDash));
+$('d-full').addEventListener('change', refreshDash);
 
 /* 系统概况 time-range presets */
 function applyDashRangePreset() {
@@ -933,6 +938,7 @@ function switchAnSub(name) {
     b.classList.toggle('active', b.dataset.sub === name));
   document.querySelectorAll('#view-analysis .subview').forEach(v =>
     v.classList.toggle('active', v.id === 'an-' + name));
+  document.body.dataset.anReady = '1';
   refreshAnalysis();
 }
 document.querySelectorAll('#an-tabs button').forEach(b =>
@@ -954,7 +960,8 @@ function applyAnRangePreset() {
     $('an-from').value = toDTLocal(to - sec);
     $('an-to').value = toDTLocal(to);
   }
-  refreshAnalysis();
+  // 初始化时不自动查排名(昂贵): 只有用户主动切页签/点查询才触发。
+  if (document.body.dataset.anReady) refreshAnalysis();
 }
 $('an-range').addEventListener('change', applyAnRangePreset);
 $('an-search').addEventListener('click', refreshAnalysis);
@@ -968,6 +975,9 @@ async function refreshAnalysis() {
   if (dev) p.set('device', dev);
   if (from) p.set('from', from);
   if (to) p.set('to', to);
+  // 流量分析 需要 IP/应用排名: 显式传 full=1 让后端只算排名,
+  // 不算域/top 等其它 概况 extras(它们对排名页无用且昂贵)。
+  p.set('full', '1');
   try {
     const o = await api('/api/official-stats?' + p.toString());
     if (anSubState.sub === 'iprank') {
@@ -1034,7 +1044,6 @@ setupAuth().then(() => {
   runAuditQuery();
   refreshDevices();
 });
-
 // load full app dictionary in background; badges render with fallback until ready
 loadAppNames();
 

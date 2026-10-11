@@ -83,6 +83,9 @@
         <option value="0">全部时间</option>
         <option value="custom">自定义</option>
       </select>
+      <label title="勾选后按需计算排名/Top域名/设备分布/最近记录(大表下较慢,默认关闭以保持概况秒开)">
+        <input type="checkbox" id="d-full"> 详细统计
+      </label>
       <button class="btn primary" id="d-search">查询</button>
     </div>
 
@@ -143,7 +146,7 @@
         </tr></thead>
         <tbody id="s-recent"></tbody>
       </table></div>
-      <div id="s-recent-empty" class="empty" style="display:none;">暂无数据 — 等待 Panabit 日志到达…</div>
+      <div id="s-recent-empty" class="empty" style="display:none;">暂无数据 — 勾选「详细统计」查看最近记录与排名…</div>
     </div>
   </section>
 
@@ -310,7 +313,7 @@
           </tr></thead>
           <tbody id="an-iprank-body"></tbody>
         </table></div>
-        <div id="an-iprank-empty" class="empty" style="display:none;">暂无IP流量数据。</div>
+        <div id="an-iprank-empty" class="empty" style="display:none;">点击「查询」加载 IP 排名(排名在大表上较慢)。</div>
       </div>
     </div>
 
@@ -323,7 +326,7 @@
           </tr></thead>
           <tbody id="an-apprank-body"></tbody>
         </table></div>
-        <div id="an-apprank-empty" class="empty" style="display:none;">暂无应用排名数据。</div>
+        <div id="an-apprank-empty" class="empty" style="display:none;">点击「查询」加载应用排名(排名在大表上较慢)。</div>
       </div>
     </div>
   </section>
