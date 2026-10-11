@@ -177,6 +177,18 @@ func TestStats(t *testing.T) {
 	}
 }
 
+func TestWarmup(t *testing.T) {
+	s := openTest(t)
+	if err := s.InsertBatch(sampleEntries()); err != nil {
+		t.Fatal(err)
+	}
+	// Must run clean on a populated DB; the dashboard endpoints issue the
+	// same index-bounded scans, so a warm DB returns without error.
+	if err := s.Warmup(); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+}
+
 // ---- devices ----
 
 func TestDevices(t *testing.T) {

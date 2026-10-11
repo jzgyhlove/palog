@@ -620,16 +620,20 @@ type Counters struct {
 	ParseErrors int64
 }
 
-// statsWindow is the lookback window for dashboard aggregates. All group-by
-// and count queries in Stats() are bounded to this window so they stay fast
-// even as the table grows to millions of rows.
-//
-// NOTE: 1h was chosen over 24h because on large tables (4 GB+) a 24h
-// GROUP BY over 6M+ rows takes 5-18s; 1h keeps it under ~1s.
+// statsWindow bounds every group-by in Stats() to the trailing hour so the
+// endpoint stays cheap as the table grows to millions of rows. The hourly
+// trend chart is the one exception: it keeps its 24h span because the UI
+// trend sparkline needs 24 buckets and that GROUP BY is index-bounded.
 const statsWindow = 1 * time.Hour
 
-// Stats aggregates dashboard data over the last 24 h. devices limits scope
-// (nil = all).
+// Stats aggregates dashboard data. devices limits scope (nil = all).
+//
+// Cost: every aggregate except the 24h hourly trend is bounded to the
+// trailing hour (statsWindow) via idx_logs_ts, so the call stays an
+// index-bounded set of cheap queries on large tables. The UI only consumes
+// Hourly from this endpoint (the 24h trend sparkline); all other dashboard
+// numbers come from /api/official-stats, which carries its own cheap/full
+// cost split.
 func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stats, error) {
 	st := &Stats{
 		Packets:     c.Packets,
@@ -645,7 +649,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	from := time.Now().Add(-statsWindow).Unix()
 	scope, sargs := scopeCond(devices)
 
-	// baseWhere: the 24h ts guard plus optional device scope.
+	// baseWhere: the 1h ts guard plus optional device scope.
 	baseWhere := " WHERE ts >= ?"
 	baseArgs := []interface{}{from}
 	if scope != "" {
@@ -653,23 +657,13 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		baseArgs = append(baseArgs, sargs...)
 	}
 
-	// Total: count in the 24h window.
+	// Total + last hour share the same guard (window is 1h).
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
 		return nil, err
 	}
+	st.LastHour = st.Total
 
-	// LastHour.
-	hourWhere := " WHERE ts >= ?"
-	hourArgs := []interface{}{time.Now().Unix() - 3600}
-	if scope != "" {
-		hourWhere += " AND " + scope
-		hourArgs = append(hourArgs, sargs...)
-	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+hourWhere, hourArgs...).Scan(&st.LastHour); err != nil {
-		return nil, err
-	}
-
-	// ByKind (24h window).
+	// ByKind (1h window).
 	rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
 	if err != nil {
 		return nil, err
@@ -688,7 +682,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		return nil, err
 	}
 
-	// ByDevice (24h window, excluding empty device sentinel).
+	// ByDevice (1h window, excluding empty device sentinel).
 	devWhere := baseWhere
 	if baseWhere == " WHERE ts >= ?" {
 		devWhere += " AND device != ''"
@@ -726,9 +720,8 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	}
 
 	// 24 contiguous hourly buckets ending at the current hour (UTC labels).
-	// Even though statsWindow is now 1h, the trend chart still wants 24
-	// buckets for the sparkline. To stay fast we compute the buckets from a
-	// pre-aggregated 24h subquery using the idx_logs_ts index (fast COUNT).
+	// The trend chart needs 24 buckets even though the other aggregates are
+	// 1h-bounded; the ts guard keeps this GROUP BY index-driven.
 	now := time.Now().UTC()
 	curHour := now.Truncate(time.Hour)
 	hWhere := " WHERE ts >= ?"
@@ -1136,6 +1129,46 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	}
 
 	return out, nil
+}
+
+// Warmup primes the SQLite page cache so the first user request does not pay
+// the cold-cache cost of scanning the large index/tree pages. It touches the
+// same index-bounded scans the dashboard runs (trailing-1h count, trailing-
+// 24h hourly bucket, top-domain/top-src aggregates).
+func (s *Store) Warmup() error {
+	now := time.Now()
+	hour := now.Add(-time.Hour).Unix()
+	day := now.Add(-24 * time.Hour).Unix()
+	var n int64
+	if err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM logs WHERE ts >= ?", hour).Scan(&n); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(
+		"SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= ? GROUP BY h", day)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var h, c int64
+		if err := rows.Scan(&h, &c); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM (SELECT domain FROM logs WHERE ts >= ? AND domain != '' GROUP BY domain ORDER BY COUNT(*) DESC LIMIT 10)",
+		hour).Scan(&n); err != nil {
+		return err
+	}
+	return s.db.QueryRow(
+		"SELECT COUNT(*) FROM (SELECT src_ip FROM logs WHERE ts >= ? AND src_ip != '' GROUP BY src_ip ORDER BY COUNT(*) DESC LIMIT 10)",
+		hour).Scan(&n)
 }
 
 // GetConfig loads config from kv with defaults; dbPath comes from the flag.

@@ -77,6 +77,15 @@ func main() {
 		slog.Info("app dictionary loaded", "entries", n)
 	}
 
+	// Prime the SQLite page cache so the first dashboard request after a
+	// restart does not pay the cold-cache cost of scanning large index
+	// trees. Fails soft: a warmup error must never block startup.
+	go func() {
+		if err := st.Warmup(); err != nil {
+			slog.Warn("store warmup", "err", err)
+		}
+	}()
+
 	rx := receiver.New(st, 4096)
 	go func() {
 		if err := rx.Run(ctx); err != nil {
