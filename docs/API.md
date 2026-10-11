@@ -110,8 +110,28 @@ Body:`{"username":"admin","password":"..."}`。
 - 成功:`200 {"ok":true}`,并吊销该用户除当前 token 外的**所有其他会话**(本会话保持有效)
 - 改密后旧密码立即失效,其他设备/浏览器的历史 token 全部作废
 
+#### GET /api/official-stats
+系统概况/流量分析聚合(按用户设备范围过滤)。
+Query 参数:`device`(可选,越权 → 403)、`from`/`to`(Unix 秒或 RFC3339,缺省 = 不设时间边界,`LastHour` 镜像尾小时)、`full`(可选,`1`/`true` 启用重聚合)。
+
+- **默认(无 `full`)**:轻量路径,供 系统概况 1h 自动刷新 — 只计算走 `idx_logs_ts`/`idx_logs_ts_kind` 索引的聚合:流量汇总(+尾小时计数)、`by_kind`、security 段。大表上保持秒级。响应中 `ip_ranking`/`app_ranking` 为空数组,`top_domains`/`top_src_ip`/`by_device`/`recent` 缺省。
+- **`?full=1`**:按当前窗口(无窗口时 extras 限定尾小时)追加计算 IP 排名 Top20、应用排名 Top20、Top 域名/源 IP、设备分布、最近 10 条。流量分析页显式携带此参数。
+
+响应:
+```json
+{"traffic":{"total_records":0,"bytes_in":0,"bytes_out":0,"last_hour":0,
+            "by_kind":{"dnsquery":0,"http":0,"session":0}},
+ "security":{"parse_errors":0,"last_hour":0},
+ "ip_ranking":[{"ip":"10.0.0.1","records":0,"bytes":0}],
+ "app_ranking":[{"value":"WWW","count":0}],
+ "top_domains":[{"value":"a.example.com","count":0}],
+ "top_src_ip":[{"value":"10.0.0.1","count":0}],
+ "by_device":{"fw-1":0},
+ "recent":[ /* 同 /api/logs item 形状,最多 10 条 */ ]}
+```
+
 #### GET /api/stats
-仪表盘数据。`?device=` 过滤单设备(普通用户仅能查权限内设备,越权 → 403):
+仪表盘数据(趋势图等)。`?device=` 过滤单设备(普通用户仅能查权限内设备,越权 → 403):
 ```json
 {
   "total": 15000, "last_hour": 800, "pps": 2.8,
