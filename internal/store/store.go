@@ -191,6 +191,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_src ON logs(src_ip);
 CREATE INDEX IF NOT EXISTS idx_logs_dst ON logs(dst_ip);
 CREATE INDEX IF NOT EXISTS idx_logs_domain ON logs(domain);
 CREATE INDEX IF NOT EXISTS idx_logs_device ON logs(device);
+CREATE INDEX IF NOT EXISTS idx_logs_ts_kind ON logs(ts, kind);
+CREATE INDEX IF NOT EXISTS idx_logs_ts_device ON logs(ts, device);
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -533,7 +535,13 @@ type Counters struct {
 	ParseErrors int64
 }
 
-// Stats aggregates dashboard data. devices limits scope (nil = all).
+// statsWindow is the lookback window for dashboard aggregates. All group-by
+// and count queries in Stats() are bounded to this window so they stay fast
+// even as the table grows to millions of rows.
+const statsWindow = 24 * time.Hour
+
+// Stats aggregates dashboard data over the last 24 h. devices limits scope
+// (nil = all).
 func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stats, error) {
 	st := &Stats{
 		Packets:     c.Packets,
@@ -545,36 +553,36 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	if uptime.Seconds() > 0 {
 		st.PPS = float64(c.Packets) / uptime.Seconds()
 	}
+
+	from := time.Now().Add(-statsWindow).Unix()
 	scope, sargs := scopeCond(devices)
-	where := ""
-	args := []interface{}{}
+
+	// baseWhere: the 24h ts guard plus optional device scope.
+	baseWhere := " WHERE ts >= ?"
+	baseArgs := []interface{}{from}
 	if scope != "" {
-		where = " WHERE " + scope
-		args = sargs
+		baseWhere += " AND " + scope
+		baseArgs = append(baseArgs, sargs...)
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+where, args...).Scan(&st.Total); err != nil {
-		return nil, err
-	}
-	// LastHour: append a ts guard to the scope filter. When scope is empty
-	// `where` is empty, so build from a bare ts clause instead of concatenating.
-	lastWhere := " WHERE ts >= ?"
-	lastArgs := []interface{}{time.Now().Unix() - 3600}
-	if where != "" {
-		lastWhere = where + " AND ts >= ?"
-		lastArgs = append(append([]interface{}{}, sargs...), time.Now().Unix()-3600)
-	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastWhere, lastArgs...).Scan(&st.LastHour); err != nil {
+
+	// Total: count in the 24h window.
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
 		return nil, err
 	}
 
-	groupWhere := ""
-	gArgs := []interface{}{}
+	// LastHour.
+	hourWhere := " WHERE ts >= ?"
+	hourArgs := []interface{}{time.Now().Unix() - 3600}
 	if scope != "" {
-		groupWhere = " WHERE " + scope
-		gArgs = append(gArgs, sargs...)
+		hourWhere += " AND " + scope
+		hourArgs = append(hourArgs, sargs...)
 	}
-	// ByKind: same table filter groupWhere (empty = all rows).
-	rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+groupWhere+" GROUP BY kind", gArgs...)
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+hourWhere, hourArgs...).Scan(&st.LastHour); err != nil {
+		return nil, err
+	}
+
+	// ByKind (24h window).
+	rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -592,14 +600,14 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		return nil, err
 	}
 
-	// ByDevice: same filter, plus excluding the empty device sentinel.
-	// groupWhere may be empty (no scope), so build the clause conditionally.
-	devWhere := " WHERE device != ''"
-	devArgs := []interface{}{}
-	if groupWhere != "" {
-		devWhere = groupWhere + " AND device != ''"
-		devArgs = gArgs
+	// ByDevice (24h window, excluding empty device sentinel).
+	devWhere := baseWhere
+	if baseWhere == " WHERE ts >= ?" {
+		devWhere += " AND device != ''"
+	} else {
+		devWhere += " AND device != ''"
 	}
+	devArgs := baseArgs
 	rows, err = s.db.Query("SELECT device, COUNT(*) FROM logs"+devWhere+" GROUP BY device ORDER BY 2 DESC", devArgs...)
 	if err != nil {
 		return nil, err
@@ -618,10 +626,10 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		return nil, err
 	}
 
-	if st.TopDomains, err = s.topValues("domain", 10, scope, sargs); err != nil {
+	if st.TopDomains, err = s.topValues("domain", 10, baseWhere, baseArgs); err != nil {
 		return nil, err
 	}
-	if st.TopSrcIP, err = s.topValues("src_ip", 10, scope, sargs); err != nil {
+	if st.TopSrcIP, err = s.topValues("src_ip", 10, baseWhere, baseArgs); err != nil {
 		return nil, err
 	}
 
@@ -635,8 +643,8 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	hWhere := " WHERE ts >= ?"
 	hArgs := []interface{}{curHour.Add(-23 * time.Hour).Unix()}
 	if scope != "" {
-		hWhere = " WHERE " + scope + " AND ts >= ?"
-		hArgs = append(append([]interface{}{}, sargs...), curHour.Add(-23*time.Hour).Unix())
+		hWhere += " AND " + scope
+		hArgs = append(hArgs, sargs...)
 	}
 	rows, err = s.db.Query("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
 	if err != nil {
@@ -664,25 +672,52 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		})
 	}
 
-	_, recent, err := s.Query(LogQuery{Limit: 10, Order: "desc", Devices: devices})
+	// Recent: last 10 rows, ts-ordered, no full-table scan.
+	recentFrom := time.Now().Add(-time.Hour).Unix()
+	recentWhere := " WHERE ts >= ?"
+	recentArgs := []interface{}{recentFrom}
+	if scope != "" {
+		recentWhere += " AND " + scope
+		recentArgs = append(recentArgs, sargs...)
+	}
+	recentRows, err := s.db.Query(
+		"SELECT "+logCols+" FROM logs"+recentWhere+
+			" ORDER BY ts DESC, id DESC LIMIT 10", recentArgs...)
 	if err != nil {
 		return nil, err
 	}
-	st.Recent = recent
+	recentItems := make([]Entry, 0, 10)
+	for recentRows.Next() {
+		e, err := scanEntry(recentRows.Scan)
+		if err != nil {
+			recentRows.Close()
+			return nil, err
+		}
+		recentItems = append(recentItems, e)
+	}
+	recentRows.Close()
+	if err := recentRows.Err(); err != nil {
+		return nil, err
+	}
+	st.Recent = recentItems
 	return st, nil
 }
 
-func (s *Store) topValues(col string, n int, scope string, sargs []interface{}) ([]CountValue, error) {
+// topValues returns the top n values of col for rows in the given where
+// clause (which must include a ts guard to stay fast).
+func (s *Store) topValues(col string, n int, where string, args []interface{}) ([]CountValue, error) {
 	// col is an internal constant, never user input.
-	where := " WHERE " + col + " != ''"
-	args := []interface{}{}
-	if scope != "" {
-		where += " AND " + scope
-		args = append(args, sargs...)
+	// Append col != '' filter to the provided where clause.
+	fullWhere := where
+	if fullWhere == "" {
+		fullWhere = " WHERE " + col + " != ''"
+	} else {
+		fullWhere += " AND " + col + " != ''"
 	}
-	args = append(args, n)
+	fullArgs := append([]interface{}{}, args...)
+	fullArgs = append(fullArgs, n)
 	rows, err := s.db.Query(
-		"SELECT "+col+", COUNT(*) AS c FROM logs"+where+" GROUP BY "+col+" ORDER BY c DESC LIMIT ?", args...)
+		"SELECT "+col+", COUNT(*) AS c FROM logs"+fullWhere+" GROUP BY "+col+" ORDER BY c DESC LIMIT ?", fullArgs...)
 	if err != nil {
 		return nil, err
 	}
