@@ -545,52 +545,76 @@ func TestOfficialStats(t *testing.T) {
 	}
 	now := time.Now().Unix()
 
-	// Default (no window): 系统概况 path — overview extras must be present
-	// and bounded to the trailing hour.
-	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0)
+	// Default cheap (系统概况 auto-refresh): only index-bounded aggregates —
+	// no rankings, no extras, so a large 1h row set stays fast.
+	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if def.Traffic.TotalRecords != 2 {
 		t.Fatalf("default total=%d, want 2", def.Traffic.TotalRecords)
 	}
-	if len(def.TopDomains) != 2 || def.TopDomains[0].Value != "a.example.com" {
-		t.Fatalf("top domains: %v", def.TopDomains)
+	if len(def.IPRanking) != 0 || len(def.AppRanking) != 0 {
+		t.Fatalf("cheap path must skip rankings: ip=%d app=%d",
+			len(def.IPRanking), len(def.AppRanking))
 	}
-	if len(def.TopSrcIP) != 2 {
-		t.Fatalf("top src ip: %v", def.TopSrcIP)
+	if len(def.TopDomains) != 0 || len(def.TopSrcIP) != 0 ||
+		len(def.ByDevice) != 0 || len(def.Recent) != 0 {
+		t.Fatalf("cheap path must skip overview extras: %+v", def)
 	}
-	if def.ByDevice["fw-1"] != 1 || def.ByDevice["fw-2"] != 1 {
-		t.Fatalf("by device: %v", def.ByDevice)
-	}
-	if len(def.Recent) != 2 {
-		t.Fatalf("recent: %d, want 2", len(def.Recent))
-	}
-	// Security.LastHour mirrors the traffic window total for the default call.
+	// Security.LastHour mirrors the traffic trailing-hour total.
 	if def.Security.LastHour != 2 {
 		t.Fatalf("security last hour=%d, want 2", def.Security.LastHour)
 	}
 
-	// Explicit window: 流量分析 path — window aggregates present, overview
-	// extras skipped (they only belong to the default 概况 call).
-	custom, err := s.OfficialStats(Counters{}, nil, now-3600, now)
+	// Explicit window, no full: 流量分析 default — rankings present,
+	// extras skipped, last_hour mirrors the window total.
+	custom, err := s.OfficialStats(Counters{}, nil, now-3600, now, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if custom.Traffic.TotalRecords != 2 {
 		t.Fatalf("window total=%d, want 2", custom.Traffic.TotalRecords)
 	}
+	if len(custom.IPRanking) == 0 {
+		t.Fatalf("window call must compute ip ranking: %+v", custom)
+	}
+	if len(custom.AppRanking) != 0 {
+		t.Fatalf("window call with no appid rows: app ranking should be empty, got %+v", custom)
+	}
 	if len(custom.TopDomains) != 0 || len(custom.TopSrcIP) != 0 ||
 		len(custom.ByDevice) != 0 || len(custom.Recent) != 0 {
-		t.Fatalf("window call must skip overview extras: %+v", custom)
+		t.Fatalf("window call without full must skip extras: %+v", custom)
 	}
 	if custom.Traffic.LastHour != custom.Traffic.TotalRecords {
 		t.Fatalf("window last_hour=%d total=%d, want equal",
 			custom.Traffic.LastHour, custom.Traffic.TotalRecords)
 	}
 
+	// full=true default: 系统概况 deep-dive — rankings + extras present
+	// and bounded to the trailing hour.
+	fullDef, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullDef.TopDomains) != 2 || fullDef.TopDomains[0].Value != "a.example.com" {
+		t.Fatalf("top domains: %v", fullDef.TopDomains)
+	}
+	if len(fullDef.TopSrcIP) != 2 {
+		t.Fatalf("top src ip: %v", fullDef.TopSrcIP)
+	}
+	if fullDef.ByDevice["fw-1"] != 1 || fullDef.ByDevice["fw-2"] != 1 {
+		t.Fatalf("by device: %v", fullDef.ByDevice)
+	}
+	if len(fullDef.Recent) != 2 {
+		t.Fatalf("recent: %d, want 2", len(fullDef.Recent))
+	}
+	if len(fullDef.IPRanking) == 0 {
+		t.Fatalf("full default must compute ip ranking")
+	}
+
 	// Out-of-range window: counts fall back to 0, no full-table scan.
-	none, err := s.OfficialStats(Counters{}, nil, now-100000, now-99000)
+	none, err := s.OfficialStats(Counters{}, nil, now-100000, now-99000, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +624,7 @@ func TestOfficialStats(t *testing.T) {
 	}
 
 	// Device scope still applies to the default path.
-	scoped, err := s.OfficialStats(Counters{}, []string{"fw-1"}, 0, 0)
+	scoped, err := s.OfficialStats(Counters{}, []string{"fw-1"}, 0, 0, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
