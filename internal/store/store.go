@@ -69,6 +69,29 @@ type LogQuery struct {
 	Order   string // asc | desc
 }
 
+// OfficialStats is a compact payload for the official-style pages.
+type OfficialStats struct {
+	Traffic struct {
+		TotalRecords int64            `json:"total_records"`
+		BytesIn      int64            `json:"bytes_in"`
+		BytesOut     int64            `json:"bytes_out"`
+		LastHour     int64            `json:"last_hour"`
+		ByKind       map[string]int64 `json:"by_kind"`
+	} `json:"traffic"`
+	Security struct {
+		ParseErrors int64 `json:"parse_errors"`
+		LastHour    int64 `json:"last_hour"`
+	} `json:"security"`
+	IPRanking []IPRankValue `json:"ip_ranking"`
+	AppRanking []CountValue  `json:"app_ranking"`
+}
+
+type IPRankValue struct {
+	IP       string `json:"ip"`
+	Bytes    int64  `json:"bytes"`
+	Records  int64  `json:"records"`
+}
+
 // Stats is the dashboard payload.
 type Stats struct {
 	Total       int64            `json:"total"`
@@ -673,6 +696,141 @@ func (s *Store) topValues(col string, n int, scope string, sargs []interface{}) 
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// OfficialStats computes compact aggregates for the official-style pages.
+// devices limits scope the same way Stats does.
+func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, error) {
+	out := &OfficialStats{}
+	out.Security.ParseErrors = c.ParseErrors
+
+	scope, sargs := scopeCond(devices)
+	baseWhere := ""
+	baseArgs := []interface{}{}
+	if scope != "" {
+		baseWhere = " WHERE " + scope
+		baseArgs = sargs
+	}
+
+	traffic := func() error {
+		var total int64
+		var bytesIn, bytesOut int64
+		// First aggregate everything, then by kind.
+		if err := s.db.QueryRow(
+			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+baseWhere,
+			baseArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
+			return err
+		}
+		out.Traffic.TotalRecords = total
+		out.Traffic.BytesIn = bytesIn
+		out.Traffic.BytesOut = bytesOut
+
+		// last-hour count
+		lastWhere := baseWhere
+		lastArgs := append([]interface{}{}, baseArgs...)
+		if lastWhere == "" {
+			lastWhere = " WHERE ts >= ?"
+			lastArgs = []interface{}{time.Now().Unix() - 3600}
+		} else {
+			lastWhere += " AND ts >= ?"
+			lastArgs = append(lastArgs, time.Now().Unix()-3600)
+		}
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastWhere, lastArgs...).Scan(&out.Traffic.LastHour); err != nil {
+			return err
+		}
+
+		// by kind
+		out.Traffic.ByKind = map[string]int64{}
+		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k string
+			var n int64
+			if err := rows.Scan(&k, &n); err != nil {
+				return err
+			}
+			out.Traffic.ByKind[k] = n
+		}
+		return rows.Err()
+	}
+	if err := traffic(); err != nil {
+		return nil, err
+	}
+
+	// security last hour
+	secWhere := baseWhere
+	secArgs := append([]interface{}{}, baseArgs...)
+	if secWhere == "" {
+		secWhere = " WHERE ts >= ?"
+		secArgs = []interface{}{time.Now().Unix() - 3600}
+	} else {
+		secWhere += " AND ts >= ?"
+		secArgs = append(secArgs, time.Now().Unix()-3600)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+secWhere, secArgs...).Scan(&out.Security.LastHour); err != nil {
+		return nil, err
+	}
+
+	// IP ranking by total bytes (src_ip first, then dst_ip, then all non-empty)
+	ipWhere := " WHERE (src_ip != '' OR dst_ip != '')"
+	ipArgs := []interface{}{}
+	if scope != "" {
+		ipWhere += " AND " + scope
+		ipArgs = sargs
+	}
+	rows, err := s.db.Query(
+		"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
+			" GROUP BY 1 ORDER BY 3 DESC LIMIT 20", ipArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v IPRankValue
+		if err := rows.Scan(&v.IP, &v.Records, &v.Bytes); err != nil {
+			return nil, err
+		}
+		if v.IP == "" {
+			continue
+		}
+		out.IPRanking = append(out.IPRanking, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// App ranking by appid count, excluding unknown (-1)
+	appWhere := " WHERE appid >= 0"
+	appArgs := []interface{}{}
+	if scope != "" {
+		appWhere += " AND " + scope
+		appArgs = sargs
+	}
+	appRows, err := s.db.Query(
+		"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer appRows.Close()
+	for appRows.Next() {
+		var appid int
+		var n int64
+		if err := appRows.Scan(&appid, &n); err != nil {
+			return nil, err
+		}
+		out.AppRanking = append(out.AppRanking, CountValue{
+			Value: strconv.Itoa(appid),
+			Count: n,
+		})
+	}
+	if err := appRows.Err(); err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }
 
 // GetConfig loads config from kv with defaults; dbPath comes from the flag.

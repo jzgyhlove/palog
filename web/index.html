@@ -52,6 +52,9 @@
     <button data-view="dash" class="active">仪表盘</button>
     <button data-view="logs">日志查询</button>
     <button data-view="sys">系统管理</button>
+    <button data-view="overview">系统概况</button>
+    <button data-view="audit">日志审计</button>
+    <button data-view="analysis">流量分析</button>
   </nav>
   <div class="header-right">
     <span class="live" id="live-dot">实时</span>
@@ -237,6 +240,171 @@
           </div>
           <div class="faint" style="margin-top:10px; font-size:11.5px;">提示: UDP 监听端口在「设备管理」中按设备配置。</div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 系统概况 ======================= -->
+  <section class="view" id="view-overview">
+    <h2>系统概况
+      <select id="ov-device" class="inline-select" title="按设备查看">
+        <option value="">全部设备</option>
+      </select>
+    </h2>
+    <nav class="subtabs" id="ov-tabs">
+      <button data-sub="traffic" class="active">流量概况</button>
+      <button data-sub="security">安全概况</button>
+    </nav>
+
+    <div class="subview active" id="ov-traffic">
+      <div class="grid g-2">
+        <div class="card stat"><div class="lbl">总记录数</div><div class="num" id="ov-tr-total">-</div></div>
+        <div class="card stat"><div class="lbl">最近 1 小时记录</div><div class="num" id="ov-tr-hour">-</div></div>
+        <div class="card stat"><div class="lbl">上行流量</div><div class="num" id="ov-tr-up">-</div></div>
+        <div class="card stat"><div class="lbl">下行流量</div><div class="num" id="ov-tr-down">-</div></div>
+      </div>
+      <div class="card" style="margin-top:14px;">
+        <h3>按日志类型分布</h3>
+        <div id="ov-tr-kinds"></div>
+      </div>
+    </div>
+
+    <div class="subview" id="ov-security">
+      <div class="grid g-2">
+        <div class="card stat"><div class="lbl">解析错误</div><div class="num" id="ov-sec-err">-</div></div>
+        <div class="card stat"><div class="lbl">最近 1 小时记录</div><div class="num" id="ov-sec-hour">-</div></div>
+      </div>
+      <div class="card" style="margin-top:14px;">
+        <h3>事件概览</h3>
+        <div id="ov-sec-events"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 日志审计 ======================= -->
+  <section class="view" id="view-audit">
+    <h2>日志审计
+      <select id="au-device" class="inline-select" title="按设备查看">
+        <option value="">全部设备</option>
+      </select>
+    </h2>
+    <nav class="subtabs" id="au-tabs">
+      <button data-sub="session" class="active">会话日志</button>
+      <button data-sub="url">URL日志</button>
+      <button data-sub="dns">DNS日志</button>
+      <button data-sub="identity">虚拟身份</button>
+    </nav>
+
+    <div class="subview active" id="au-session">
+      <div class="card">
+        <h3>会话日志（二进制 PNB 会话 + HTTP）</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>时间</th><th>设备</th><th>类型</th><th>来源</th><th>目的</th>
+            <th>协议</th><th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>流入/流出</th>
+          </tr></thead>
+          <tbody id="au-session-body"></tbody>
+        </table></div>
+        <div id="au-session-empty" class="empty" style="display:none;">暂无会话日志。</div>
+        <div class="pager">
+          <button class="btn sm" id="au-session-prev">‹ 上一页</button>
+          <span>共 <b id="au-session-total">0</b> 条 · 第 <b id="au-session-page">1</b> 页</span>
+          <button class="btn sm" id="au-session-next">下一页 ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="subview" id="au-url">
+      <div class="card">
+        <h3>URL日志（HTTP）</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>方法</th>
+            <th>Host</th><th>路径</th><th>应用 ID</th><th>用户</th>
+          </tr></thead>
+          <tbody id="au-url-body"></tbody>
+        </table></div>
+        <div id="au-url-empty" class="empty" style="display:none;">暂无URL日志。</div>
+        <div class="pager">
+          <button class="btn sm" id="au-url-prev">‹ 上一页</button>
+          <span>共 <b id="au-url-total">0</b> 条 · 第 <b id="au-url-page">1</b> 页</span>
+          <button class="btn sm" id="au-url-next">下一页 ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="subview" id="au-dns">
+      <div class="card">
+        <h3>DNS日志</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>域名</th><th>用户</th>
+          </tr></thead>
+          <tbody id="au-dns-body"></tbody>
+        </table></div>
+        <div id="au-dns-empty" class="empty" style="display:none;">暂无DNS日志。</div>
+        <div class="pager">
+          <button class="btn sm" id="au-dns-prev">‹ 上一页</button>
+          <span>共 <b id="au-dns-total">0</b> 条 · 第 <b id="au-dns-page">1</b> 页</span>
+          <button class="btn sm" id="au-dns-next">下一页 ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="subview" id="au-identity">
+      <div class="card">
+        <h3>虚拟身份（QQ 登录 / 用户）</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>用户 / QQ号</th>
+          </tr></thead>
+          <tbody id="au-identity-body"></tbody>
+        </table></div>
+        <div id="au-identity-empty" class="empty" style="display:none;">暂无虚拟身份日志。</div>
+        <div class="pager">
+          <button class="btn sm" id="au-identity-prev">‹ 上一页</button>
+          <span>共 <b id="au-identity-total">0</b> 条 · 第 <b id="au-identity-page">1</b> 页</span>
+          <button class="btn sm" id="au-identity-next">下一页 ›</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 流量分析 ======================= -->
+  <section class="view" id="view-analysis">
+    <h2>流量分析
+      <select id="an-device" class="inline-select" title="按设备查看">
+        <option value="">全部设备</option>
+      </select>
+    </h2>
+    <nav class="subtabs" id="an-tabs">
+      <button data-sub="iprank" class="active">流量排名-IP排名</button>
+      <button data-sub="apprank">应用排名</button>
+    </nav>
+
+    <div class="subview active" id="an-iprank">
+      <div class="card">
+        <h3>IP流量排名（按总字节）</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>#</th><th>IP</th><th>记录数</th><th>总流量</th>
+          </tr></thead>
+          <tbody id="an-iprank-body"></tbody>
+        </table></div>
+        <div id="an-iprank-empty" class="empty" style="display:none;">暂无IP流量数据。</div>
+      </div>
+    </div>
+
+    <div class="subview" id="an-apprank">
+      <div class="card">
+        <h3>应用排名（按记录数）</h3>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>#</th><th>应用 ID</th><th>记录数</th>
+          </tr></thead>
+          <tbody id="an-apprank-body"></tbody>
+        </table></div>
+        <div id="an-apprank-empty" class="empty" style="display:none;">暂无应用排名数据。</div>
       </div>
     </div>
   </section>

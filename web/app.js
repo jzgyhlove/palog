@@ -277,6 +277,9 @@ function switchView(name) {
     runQuery();
   }
   if (name === 'sys') refreshSys();
+  if (name === 'overview') refreshOverview();
+  if (name === 'audit') refreshAudit();
+  if (name === 'analysis') refreshAnalysis();
 }
 document.querySelectorAll('nav.tabs button').forEach(b =>
   b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -825,6 +828,312 @@ $('c-retention').addEventListener('click', async () => {
     $('c-retention').disabled = false;
   }
 });
+
+/* ---------------- 系统概况: 子页签 ---------------- */
+const ovSubState = { sub: 'traffic' };
+
+function switchOvSub(name) {
+  ovSubState.sub = name;
+  document.querySelectorAll('#ov-tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.sub === name));
+  document.querySelectorAll('#view-overview .subview').forEach(v =>
+    v.classList.toggle('active', v.id === 'ov-' + name));
+  refreshOverview();
+}
+document.querySelectorAll('#ov-tabs button').forEach(b =>
+  b.addEventListener('click', () => switchOvSub(b.dataset.sub)));
+
+async function refreshOverview() {
+  const dev = $('ov-device').value;
+  const p = new URLSearchParams();
+  if (dev) p.set('device', dev);
+  try {
+    const o = await api('/api/official-stats?' + p.toString());
+    if (ovSubState.sub === 'traffic') {
+      $('ov-tr-total').textContent = fmtNum(o.traffic.total_records);
+      $('ov-tr-hour').textContent = fmtNum(o.traffic.last_hour);
+      $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流出</small>';
+      $('ov-tr-down').innerHTML = fmtBytes(o.traffic.bytes_in) + ' <small>流入</small>';
+      kindShareOv(o.traffic.by_kind);
+    }
+    if (ovSubState.sub === 'security') {
+      $('ov-sec-err').textContent = fmtNum(o.security.parse_errors);
+      $('ov-sec-hour').textContent = fmtNum(o.security.last_hour);
+      renderSecurityEvents(o);
+    }
+  } catch (err) {
+    if (err.message !== 'unauthorized') toast('系统概况加载失败: ' + err.message, true);
+  }
+}
+
+function kindShareOv(byKind) {
+  const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话', qqlogin: 'QQ 登录' };
+  const entries = Object.entries(byKind || {}).map(([k, v]) =>
+    [names[k] || k, v]).sort((a, b) => b[1] - a[1]);
+  const el = $('ov-tr-kinds');
+  if (entries.length === 0) { el.innerHTML = '<div class="h-empty">暂无数据</div>'; return; }
+  const total = entries.reduce((s, e) => s + e[1], 0) || 1;
+  el.innerHTML = entries.map(([k, v]) => {
+    const pct = Math.round(v / total * 100);
+    return '<div class="bar-row">' +
+      '<span class="key" style="font-family:var(--sans)">' + esc(k) + '</span>' +
+      '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>' +
+      '<span class="cnt">' + fmtNum(v) + ' (' + pct + '%)</span></div>';
+  }).join('');
+}
+
+function renderSecurityEvents(o) {
+  const el = $('ov-sec-events');
+  const items = [];
+  items.push({ label: '解析错误总数', value: o.security.parse_errors, badge: 'proto' });
+  items.push({ label: '最近 1 小时记录', value: o.security.last_hour, badge: 'dev' });
+  const byKind = o.traffic.by_kind || {};
+  Object.entries(byKind).forEach(([k, v]) => {
+    const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话', qqlogin: 'QQ 登录' };
+    items.push({ label: names[k] || k, value: v, badge: 'sess' });
+  });
+  el.innerHTML = items.map(it =>
+    '<div class="bar-row">' +
+    '<span class="key" style="font-family:var(--sans)">' + esc(it.label) + '</span>' +
+    '<div class="track"><div class="fill" style="width:100%;opacity:.25"></div></div>' +
+    '<span class="cnt">' + fmtNum(it.value) + '</span></div>'
+  ).join('');
+}
+
+// sync device selector
+$('ov-device').addEventListener('change', refreshOverview);
+document.addEventListener('palog:me', () => { refreshDevices(); });
+// inject ov-device, au-device, an-device into device list refresh
+(function patchRefreshDevices() {
+  const orig = refreshDevices;
+  refreshDevices = async function() {
+    await orig();
+    if (DEVICES) {
+      const opts = ['<option value="">全部设备</option>'].concat(
+        DEVICES.map(d => '<option value="' + esc(d.name) + '">' + esc(d.name) + (d.enabled ? '' : ' (已禁用)') + '</option>')
+      ).join('');
+      ['ov-device', 'au-device', 'an-device'].forEach(id => {
+        const el = $(id);
+        if (el) el.innerHTML = opts;
+      });
+    }
+  };
+})();
+
+/* ---------------- 日志审计: 子页签 ---------------- */
+const auditState = {
+  sub: 'session',
+  session: { limit: 50, offset: 0 },
+  url:     { limit: 50, offset: 0 },
+  dns:     { limit: 50, offset: 0 },
+  identity:{ limit: 50, offset: 0 },
+};
+
+function switchAuSub(name) {
+  auditState.sub = name;
+  document.querySelectorAll('#au-tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.sub === name));
+  document.querySelectorAll('#view-audit .subview').forEach(v =>
+    v.classList.toggle('active', v.id === 'au-' + name));
+  refreshAudit();
+}
+document.querySelectorAll('#au-tabs button').forEach(b =>
+  b.addEventListener('click', () => switchAuSub(b.dataset.sub)));
+
+$('au-device').addEventListener('change', refreshAudit);
+
+function auditBaseParams() {
+  const p = new URLSearchParams();
+  const dev = $('au-device').value; if (dev) p.set('device', dev);
+  return p;
+}
+
+async function fetchAuditPage(tab, kind) {
+  const st = auditState[tab];
+  const p = auditBaseParams();
+  if (kind) p.set('kind', kind);
+  p.set('limit', st.limit);
+  p.set('offset', st.offset);
+  p.set('order', 'desc');
+  const r = await api('/api/logs?' + p.toString());
+  return r;
+}
+
+async function refreshAudit() {
+  const tab = auditState.sub;
+  const body = $('au-' + tab + '-body');
+  const empty = $('au-' + tab + '-empty');
+  const totalEl = $('au-' + tab + '-total');
+  const pageEl = $('au-' + tab + '-page');
+  body.innerHTML = '<tr><td colspan="9"><div class="empty"><span class="spin" style="vertical-align:-2px;margin-right:8px;"></span>加载…</div></td></tr>';
+  try {
+    let r;
+    switch (tab) {
+      case 'session':
+        // show both binary session and HTTP logs
+        r = await fetchAuditPage('session', 'session');
+        renderAuditTable(body, empty, totalEl, pageEl, 'session', r, auditSessionRow);
+        break;
+      case 'url':
+        r = await fetchAuditPage('url', 'http');
+        renderAuditTable(body, empty, totalEl, pageEl, 'url', r, auditUrlRow);
+        break;
+      case 'dns':
+        r = await fetchAuditPage('dns', 'dnsquery');
+        renderAuditTable(body, empty, totalEl, pageEl, 'dns', r, auditDnsRow);
+        break;
+      case 'identity':
+        r = await fetchAuditPage('identity', 'qqlogin');
+        renderAuditTable(body, empty, totalEl, pageEl, 'identity', r, auditIdentityRow);
+        break;
+    }
+  } catch (err) {
+    if (err.message === 'unauthorized') return;
+    body.innerHTML = '';
+    empty.style.display = 'block';
+    empty.textContent = '查询失败: ' + err.message;
+    toast('日志审计加载失败: ' + err.message, true);
+  }
+}
+
+function renderAuditTable(body, empty, totalEl, pageEl, tab, r, rowFn) {
+  const items = r.items || [];
+  const st = auditState[tab];
+  totalEl.textContent = r.total;
+  pageEl.textContent = Math.floor(st.offset / st.limit) + 1;
+  empty.style.display = items.length ? 'none' : 'block';
+  body.innerHTML = items.map(rowFn).join('');
+  $('au-' + tab + '-prev').disabled = st.offset <= 0;
+  $('au-' + tab + '-next').disabled = st.offset + items.length >= r.total;
+}
+
+function auditSessionRow(item) {
+  const target = item.kind === 'session' ? (item.domain || item.host || '') : (item.host || '');
+  const path = item.kind === 'http' ? item.path : '';
+  const id = item.id;
+  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
+    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
+    '<td>' + kindBadge(item.kind) + '</td>' +
+    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
+    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
+    '<td>' + protoBadge(item.proto) + '</td>' +
+    '<td class="mono trunc">' + esc(target) + '</td>' +
+    '<td class="mono trunc wide">' + esc(path) + '</td>' +
+    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
+    '</tr>';
+}
+
+function auditUrlRow(item) {
+  const id = item.id;
+  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
+    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
+    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
+    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
+    '<td class="mono">' + esc(item.method || '-') + '</td>' +
+    '<td class="mono trunc">' + esc(item.host || '') + '</td>' +
+    '<td class="mono trunc wide">' + esc(item.path || '') + '</td>' +
+    '<td>' + (item.appid >= 0 ? '<span class="badge appid">' + item.appid + '</span>' : '<span class="faint">-</span>') + '</td>' +
+    '<td class="mono dim">' + esc(item.user || '-') + '</td>' +
+    '</tr>';
+}
+
+function auditDnsRow(item) {
+  const id = item.id;
+  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
+    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
+    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
+    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
+    '<td class="mono trunc wide">' + esc(item.domain || '') + '</td>' +
+    '<td class="mono dim">' + esc(item.user || '-') + '</td>' +
+    '</tr>';
+}
+
+function auditIdentityRow(item) {
+  const id = item.id;
+  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
+    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
+    '<td>' + devBadge(item.device) + '</td>' +
+    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
+    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
+    '<td class="mono">' + esc(item.user || '-') + '</td>' +
+    '</tr>';
+}
+
+// wire audit pagination
+['session', 'url', 'dns', 'identity'].forEach(tab => {
+  $('au-' + tab + '-prev').addEventListener('click', () => {
+    auditState[tab].offset = Math.max(0, auditState[tab].offset - auditState[tab].limit);
+    refreshAudit();
+  });
+  $('au-' + tab + '-next').addEventListener('click', () => {
+    auditState[tab].offset += auditState[tab].limit;
+    refreshAudit();
+  });
+});
+
+/* ---------------- 流量分析: 子页签 ---------------- */
+const anSubState = { sub: 'iprank' };
+
+function switchAnSub(name) {
+  anSubState.sub = name;
+  document.querySelectorAll('#an-tabs button').forEach(b =>
+    b.classList.toggle('active', b.dataset.sub === name));
+  document.querySelectorAll('#view-analysis .subview').forEach(v =>
+    v.classList.toggle('active', v.id === 'an-' + name));
+  refreshAnalysis();
+}
+document.querySelectorAll('#an-tabs button').forEach(b =>
+  b.addEventListener('click', () => switchAnSub(b.dataset.sub)));
+
+$('an-device').addEventListener('change', refreshAnalysis);
+
+async function refreshAnalysis() {
+  const dev = $('an-device').value;
+  const p = new URLSearchParams();
+  if (dev) p.set('device', dev);
+  try {
+    const o = await api('/api/official-stats?' + p.toString());
+    if (anSubState.sub === 'iprank') {
+      renderIpRanking(o.ip_ranking || []);
+    }
+    if (anSubState.sub === 'apprank') {
+      renderAppRanking(o.app_ranking || []);
+    }
+  } catch (err) {
+    if (err.message !== 'unauthorized') toast('流量分析加载失败: ' + err.message, true);
+  }
+}
+
+function renderIpRanking(items) {
+  const body = $('an-iprank-body');
+  const empty = $('an-iprank-empty');
+  empty.style.display = items.length ? 'none' : 'block';
+  body.innerHTML = items.map((v, i) =>
+    '<tr>' +
+    '<td class="faint">' + (i + 1) + '</td>' +
+    '<td class="mono">' + esc(v.ip) + '</td>' +
+    '<td class="mono">' + fmtNum(v.records) + '</td>' +
+    '<td class="mono dim">' + fmtBytes(v.bytes) + '</td>' +
+    '</tr>'
+  ).join('');
+}
+
+function renderAppRanking(items) {
+  const body = $('an-apprank-body');
+  const empty = $('an-apprank-empty');
+  empty.style.display = items.length ? 'none' : 'block';
+  body.innerHTML = items.map((v, i) =>
+    '<tr>' +
+    '<td class="faint">' + (i + 1) + '</td>' +
+    '<td><span class="badge appid">' + esc(v.value) + '</span></td>' +
+    '<td class="mono">' + fmtNum(v.count) + '</td>' +
+    '</tr>'
+  ).join('');
+}
 
 /* ---------------- init & timers ---------------- */
 document.addEventListener('visibilitychange', () => {

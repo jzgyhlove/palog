@@ -163,6 +163,78 @@ func postJSON(url, body string) *http.Response {
 	return resp
 }
 
+func TestOfficialStats(t *testing.T) {
+	ts, st := newTestServer(t)
+	atok, _ := login(t, ts, "admin", "adminpw")
+	utok, _ := login(t, ts, "user1", "userpw")
+
+	// seed a session row with known bytes and appid for ranking checks
+	now := time.Now().Unix()
+	if err := st.InsertBatch([]store.Entry{
+		{Device: "fw-1", Kind: "session", TS: now, RecvTS: now,
+			SrcIP: "10.0.0.1", DstIP: "1.1.1.1", Proto: 6, Appid: 42,
+			BytesIn: 1000, BytesOut: 2000},
+		{Device: "fw-1", Kind: "session", TS: now, RecvTS: now,
+			SrcIP: "10.0.0.2", DstIP: "2.2.2.2", Proto: 6, Appid: 42,
+			BytesIn: 5000, BytesOut: 6000},
+	}); err != nil {
+		t.Fatalf("seed session rows: %v", err)
+	}
+
+	// admin: full payload
+	r := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats", atok, nil))
+	traffic := r["traffic"].(map[string]any)
+	if traffic["total_records"].(float64) < 5 {
+		t.Fatalf("traffic.total_records = %v, want >= 5", traffic["total_records"])
+	}
+	// bytes_in should be at least 6000 (1000+5000 from the two session rows)
+	if traffic["bytes_in"].(float64) < 6000 {
+		t.Fatalf("traffic.bytes_in = %v, want >= 6000", traffic["bytes_in"])
+	}
+	// ip_ranking: 10.0.0.2 should be present (5000 bytes in + 6000 out = 11000)
+	ipRanking := r["ip_ranking"].([]any)
+	found := false
+	for _, iv := range ipRanking {
+		m := iv.(map[string]any)
+		if m["ip"] == "10.0.0.2" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ip_ranking missing 10.0.0.2: %v", ipRanking)
+	}
+	// app_ranking: appid 42 should appear
+	appRanking := r["app_ranking"].([]any)
+	appFound := false
+	for _, av := range appRanking {
+		m := av.(map[string]any)
+		if m["value"] == "42" {
+			appFound = true
+			break
+		}
+	}
+	if !appFound {
+		t.Fatalf("app_ranking missing appid 42: %v", appRanking)
+	}
+
+	// scoped user (fw-1 only): fw-2 rows must be excluded
+	r2 := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats", utok, nil))
+	traffic2 := r2["traffic"].(map[string]any)
+	// fw-2 has one dnsquery row; scoped user should not see it in total_records
+	// total_records should reflect only fw-1 rows
+	if traffic2["total_records"].(float64) > 4 {
+		t.Fatalf("scoped total_records = %v, want <= 4 (fw-1 only)", traffic2["total_records"])
+	}
+
+	// out-of-scope device -> 403
+	resp := doAuth(t, "GET", ts.URL+"/api/official-stats?device=fw-2", utok, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("official-stats device=fw-2 for user1 status %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestUserScopeIsolation(t *testing.T) {
 	ts, _ := newTestServer(t)
 	utok, _ := login(t, ts, "user1", "userpw")

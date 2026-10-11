@@ -54,6 +54,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/me", s.auth(s.handleMe))
 	mux.HandleFunc("PUT /api/me/password", s.auth(s.handleChangePassword))
 	mux.HandleFunc("GET /api/stats", s.auth(s.handleStats))
+	mux.HandleFunc("GET /api/official-stats", s.auth(s.handleOfficialStats))
 	mux.HandleFunc("GET /api/logs", s.auth(s.handleLogs))
 	mux.HandleFunc("GET /api/logs/{id}", s.auth(s.handleLogByID))
 	mux.HandleFunc("GET /api/devices", s.auth(s.handleDevicesGet))
@@ -304,6 +305,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
+	scope := allowedDevices(userFrom(r))
+	if d := r.URL.Query().Get("device"); d != "" {
+		if scope != nil && !contains(scope, d) {
+			writeErr(w, http.StatusForbidden, "device not in your scope")
+			return
+		}
+		scope = []string{d}
+	}
+	off, err := s.Store.OfficialStats(s.counters(), scope)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, off)
 }
 
 func contains(list []string, v string) bool {
