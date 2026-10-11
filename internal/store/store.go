@@ -278,6 +278,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_device ON logs(device);
 CREATE INDEX IF NOT EXISTS idx_logs_ts_kind ON logs(ts, kind);
 CREATE INDEX IF NOT EXISTS idx_logs_ts_device ON logs(ts, device);
 CREATE INDEX IF NOT EXISTS idx_logs_ts_appid ON logs(ts, appid);
+CREATE INDEX IF NOT EXISTS idx_logs_ts_domain ON logs(ts, domain);
+CREATE INDEX IF NOT EXISTS idx_logs_ts_src ON logs(ts, src_ip);
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -683,12 +685,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	}
 
 	// ByDevice (1h window, excluding empty device sentinel).
-	devWhere := baseWhere
-	if baseWhere == " WHERE ts >= ?" {
-		devWhere += " AND device != ''"
-	} else {
-		devWhere += " AND device != ''"
-	}
+	devWhere := baseWhere + " AND device != ''"
 	devArgs := baseArgs
 	rows, err = s.db.Query("SELECT device, COUNT(*) FROM logs"+devWhere+" GROUP BY device ORDER BY 2 DESC", devArgs...)
 	if err != nil {
@@ -907,12 +904,27 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	// Traffic totals + by_kind over the effective window. by_kind stays
 	// bounded even without a ts guard: there are only a handful of kinds,
 	// so the GROUP BY runs a small partial scan regardless of table size.
+	// A bare call (no window, not cheap) aggregates the trailing hour
+	// instead of all history, so a 系统概况 deep-dive of the default view
+	// cannot scan the full table.
+	trafficBase := baseWhere
+	trafficArgs := baseArgs
+	if !hasWindow && !cheap {
+		cutoff := time.Now().Unix() - 3600
+		if trafficBase == "" {
+			trafficBase = " WHERE ts >= ?"
+			trafficArgs = []interface{}{cutoff}
+		} else {
+			trafficBase += " AND ts >= ?"
+			trafficArgs = append(append([]interface{}{}, trafficArgs...), cutoff)
+		}
+	}
 	traffic := func() error {
 		var total int64
 		var bytesIn, bytesOut int64
 		if err := s.db.QueryRow(
-			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+baseWhere,
-			baseArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
+			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+trafficBase,
+			trafficArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
 			return err
 		}
 		out.Traffic.TotalRecords = total
@@ -928,7 +940,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		}
 
 		out.Traffic.ByKind = map[string]int64{}
-		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
+		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
 		if err != nil {
 			return err
 		}
@@ -1050,7 +1062,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	// avoid by default: top domain/src_ip lists, by-device distribution
 	// and recent rows. When a window is given they follow that window;
 	// without one they are bounded to the trailing hour so even a deep
-	// dive of the default 概况 stays a cheap index scan.
+	// dive of the default 概况 stays an index-bounded set of queries.
 	if full {
 		extraWhere := baseWhere
 		extraArgs := append([]interface{}{}, baseArgs...)
@@ -1065,6 +1077,13 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			}
 			extraArgs = append(extraArgs, cutoff)
 		}
+	// By-device on the bare call (no window) must stay bounded to the
+	// trailing hour like the other extras; on a windowed call the
+	// window already bounds it.
+	if extraWhere == "" {
+		extraWhere = " WHERE ts >= ?"
+		extraArgs = append(extraArgs, time.Now().Unix()-3600)
+	}
 
 		// Top domains
 		var err error
@@ -1079,9 +1098,6 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		// By device within the window.
 		devWhere := extraWhere
 		devArgs := append([]interface{}{}, extraArgs...)
-		if devWhere == "" {
-			devWhere = " WHERE 1=1"
-		}
 		devWhere += " AND device != ''"
 		devRows, err := s.db.Query(
 			"SELECT device, COUNT(*) FROM logs"+devWhere+
@@ -1134,7 +1150,8 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 // Warmup primes the SQLite page cache so the first user request does not pay
 // the cold-cache cost of scanning the large index/tree pages. It touches the
 // same index-bounded scans the dashboard runs (trailing-1h count, trailing-
-// 24h hourly bucket, top-domain/top-src aggregates).
+// 24h hourly bucket, top-domain/top-src aggregates) and drives every logs
+// index so its tree pages are cached.
 func (s *Store) Warmup() error {
 	now := time.Now()
 	hour := now.Add(-time.Hour).Unix()
@@ -1161,14 +1178,30 @@ func (s *Store) Warmup() error {
 		return err
 	}
 	rows.Close()
-	if err := s.db.QueryRow(
-		"SELECT COUNT(*) FROM (SELECT domain FROM logs WHERE ts >= ? AND domain != '' GROUP BY domain ORDER BY COUNT(*) DESC LIMIT 10)",
-		hour).Scan(&n); err != nil {
-		return err
+	// Top-N aggregates use the (ts, domain)/(ts, src_ip) composite indexes
+	// over the trailing hour; touch both so their pages are cached too.
+	for _, col := range []string{"domain", "src_ip"} {
+		if err := s.db.QueryRow(
+			"SELECT COUNT(*) FROM (SELECT "+col+" FROM logs WHERE ts >= ? AND "+col+" != '' GROUP BY "+col+" ORDER BY COUNT(*) DESC LIMIT 10)",
+			hour).Scan(&n); err != nil {
+			return err
+		}
 	}
-	return s.db.QueryRow(
-		"SELECT COUNT(*) FROM (SELECT src_ip FROM logs WHERE ts >= ? AND src_ip != '' GROUP BY src_ip ORDER BY COUNT(*) DESC LIMIT 10)",
-		hour).Scan(&n)
+	// Single-row probes drive the remaining single-column indexes. Each is
+	// wrapped in COUNT(*) so a zero-match DB still returns exactly one row.
+	probes := []string{
+		"SELECT COUNT(*) FROM logs WHERE kind = ''",
+		"SELECT COUNT(*) FROM logs WHERE src_ip = ''",
+		"SELECT COUNT(*) FROM logs WHERE dst_ip = ''",
+		"SELECT COUNT(*) FROM logs WHERE device = ''",
+		"SELECT COUNT(*) FROM logs WHERE appid = 0",
+	}
+	for _, p := range probes {
+		if err := s.db.QueryRow(p).Scan(&n); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetConfig loads config from kv with defaults; dbPath comes from the flag.

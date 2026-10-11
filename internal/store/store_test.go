@@ -182,10 +182,14 @@ func TestWarmup(t *testing.T) {
 	if err := s.InsertBatch(sampleEntries()); err != nil {
 		t.Fatal(err)
 	}
-	// Must run clean on a populated DB; the dashboard endpoints issue the
-	// same index-bounded scans, so a warm DB returns without error.
+	// Must run clean on an empty DB too (fresh deployment): every probe is
+	// a COUNT(*) that returns exactly one row even with zero matches.
 	if err := s.Warmup(); err != nil {
-		t.Fatalf("warmup: %v", err)
+		t.Fatalf("warmup on populated db: %v", err)
+	}
+	empty := openTest(t)
+	if err := empty.Warmup(); err != nil {
+		t.Fatalf("warmup on empty db: %v", err)
 	}
 }
 
