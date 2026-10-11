@@ -323,6 +323,25 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+// parseBoolParam parses a query param into a bool flag: any of "1","true",
+// "yes","on" (case-insensitive) is true; empty and anything else is false.
+func parseBoolParam(v string) bool {
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// handleOfficialStats serves the 系统概况 / 流量分析 / 安全概况 aggregates.
+//
+// Cost control: the 系统概况 page auto-refreshes this endpoint every 10 s, so
+// the bare call must stay cheap no matter how many rows the 1h window holds.
+// It therefore runs only the index-bounded aggregates (LASTHOUR counts via
+// idx_logs_ts, by_kind via the handful-of-kinds partial index scan, traffic
+// totals) and skips every unbounded GROUP BY — rankings and the top-domain /
+// device / recent extras are opt-in via ?full=1. 流量分析 calls carry an
+// explicit from/to window plus ?full=1 to fetch its IP/app rankings.
 func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 	scope := allowedDevices(userFrom(r))
 	if d := r.URL.Query().Get("device"); d != "" {
@@ -345,25 +364,29 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	full := parseBoolParam(q.Get("full"))
 	// The 30 s cache only applies to the default 1h-window call that the
 	// dashboard keeps re-issuing; custom windows are always computed fresh.
-	if from == 0 && to == 0 {
+	// The default call is the cheap path: no full aggregates, only the
+	// index-bounded traffic totals / by_kind / security, so a large table
+	// never blocks the auto-refresh.
+	bareDefault := from == 0 && to == 0 && !full
+	if bareDefault {
 		if body, ok := s.cacheGet("official", scope, statsCacheTTL); ok {
 			writeJSON(w, http.StatusOK, body)
 			return
 		}
 	}
-	off, err := s.Store.OfficialStats(s.counters(), scope, from, to)
+	off, err := s.Store.OfficialStats(s.counters(), scope, from, to, full, bareDefault)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if from == 0 && to == 0 {
+	if bareDefault {
 		s.cacheSet("official", scope, off)
 	}
 	writeJSON(w, http.StatusOK, off)
 }
-
 /* ---------------- short-TTL stats cache ---------------- */
 // The dashboard and 系统概况 auto-refresh every 10 s and run several
 // expensive GROUP BY aggregates. On large tables (10M+ rows) each run

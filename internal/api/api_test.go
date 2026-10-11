@@ -184,7 +184,9 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("seed session rows: %v", err)
 	}
 
-	// admin: full payload
+	// admin: cheap default (系统概况 auto-refresh path) — traffic + security
+	// present; rankings and extras absent so the auto-refresh call cannot
+	// scan or group large row sets.
 	r := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats", atok, nil))
 	traffic := r["traffic"].(map[string]any)
 	if traffic["total_records"].(float64) < 5 {
@@ -194,8 +196,17 @@ func TestOfficialStats(t *testing.T) {
 	if traffic["bytes_in"].(float64) < 6000 {
 		t.Fatalf("traffic.bytes_in = %v, want >= 6000", traffic["bytes_in"])
 	}
+	if ipr, ok := r["ip_ranking"].([]any); ok && len(ipr) != 0 {
+		t.Fatalf("cheap default must skip ip_ranking: %v", r["ip_ranking"])
+	}
+	if appr, ok := r["app_ranking"].([]any); ok && len(appr) != 0 {
+		t.Fatalf("cheap default must skip app_ranking: %v", r["app_ranking"])
+	}
+
+	// admin: full deep-dive (?full=1) — rankings present.
+	rf := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/official-stats?full=1", atok, nil))
 	// ip_ranking: 10.0.0.2 should be present (5000 bytes in + 6000 out = 11000)
-	ipRanking := r["ip_ranking"].([]any)
+	ipRanking := rf["ip_ranking"].([]any)
 	found := false
 	for _, iv := range ipRanking {
 		m := iv.(map[string]any)
@@ -209,7 +220,7 @@ func TestOfficialStats(t *testing.T) {
 	}
 	// app_ranking: appid 42 (unmapped) should appear as the raw id;
 	// appid 23 (mapped) should appear as its official name
-	appRanking := r["app_ranking"].([]any)
+	appRanking := rf["app_ranking"].([]any)
 	appFound := false
 	mappedFound := false
 	for _, av := range appRanking {
@@ -226,6 +237,22 @@ func TestOfficialStats(t *testing.T) {
 	}
 	if !mappedFound {
 		t.Fatalf("app_ranking missing mapped name for appid 23: %v", appRanking)
+	}
+
+	// 流量分析 path: explicit window (no full) -> rankings computed within
+	// the window, extras skipped.
+	rw := decode[map[string]any](t, doAuth(t, "GET",
+		ts.URL+"/api/official-stats?from="+strconv.FormatInt(now-3600, 10)+
+			"&to="+strconv.FormatInt(now, 10), atok, nil))
+	wTraffic := rw["traffic"].(map[string]any)
+	if wTraffic["total_records"].(float64) < 5 {
+		t.Fatalf("windowed total_records = %v, want >= 5", wTraffic["total_records"])
+	}
+	if rwIPs, ok := rw["ip_ranking"].([]any); ok && len(rwIPs) == 0 {
+		t.Fatalf("windowed call must compute ip_ranking")
+	}
+	if rwEx, ok := rw["top_domains"].([]any); ok && len(rwEx) != 0 {
+		t.Fatalf("windowed call without full must skip extras: %v", rwEx)
 	}
 
 	// scoped user (fw-1 only): fw-2 rows must be excluded
