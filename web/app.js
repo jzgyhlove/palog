@@ -975,9 +975,9 @@ async function refreshAnalysis() {
   if (dev) p.set('device', dev);
   if (from) p.set('from', from);
   if (to) p.set('to', to);
-  // 流量分析 需要 IP/应用排名: 显式传 full=1 让后端只算排名,
-  // 不算域/top 等其它 概况 extras(它们对排名页无用且昂贵)。
-  p.set('full', '1');
+  // 流量分析 只需要 IP/应用排名: 显式传 rank=1(而非昂贵的 full=1),
+  // 后端据此只计算排名, 跳过域/top 等 概况 extras。
+  p.set('rank', '1');
   try {
     const o = await api('/api/official-stats?' + p.toString());
     if (anSubState.sub === 'iprank') {

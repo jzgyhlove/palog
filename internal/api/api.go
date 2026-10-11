@@ -365,19 +365,18 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	full := parseBoolParam(q.Get("full"))
-	// The 30 s cache only applies to the default 1h-window call that the
-	// dashboard keeps re-issuing; custom windows are always computed fresh.
-	// The default call is the cheap path: no full aggregates, only the
-	// index-bounded traffic totals / by_kind / security, so a large table
-	// never blocks the auto-refresh.
-	bareDefault := from == 0 && to == 0 && !full
+	rank := parseBoolParam(q.Get("rank")) || full // full deep-dive implies rankings
+	// The cache only applies to the default bare call (no window, no rank,
+	// no full) that the 系统概况 auto-refresh keeps re-issuing; everything
+	// else is computed fresh so custom ranges never serve stale data.
+	bareDefault := from == 0 && to == 0 && !rank && !full
 	if bareDefault {
-		if body, ok := s.cacheGet("official", scope, statsCacheTTL); ok {
+		if body, ok := s.cacheGet("official", scope, officialCacheTTL); ok {
 			writeJSON(w, http.StatusOK, body)
 			return
 		}
 	}
-	off, err := s.Store.OfficialStats(s.counters(), scope, from, to, full, bareDefault)
+	off, err := s.Store.OfficialStats(s.counters(), scope, from, to, full, rank, bareDefault)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -394,6 +393,13 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 // cheap without meaningfully hurting freshness.
 
 const statsCacheTTL = 30 * time.Second
+
+// officialCacheTTL memoizes the bare (cheap) 系统概况 call. The UI
+// auto-refreshes every 10 s, but the 30 s TTL is long enough that the
+// expensive underlying aggregates only re-run occasionally while the
+// page stays responsive; every other combination (rank / full /
+// explicit window) is always computed fresh.
+const officialCacheTTL = 30 * time.Second
 
 type statsCacheEntry struct {
 	at   time.Time

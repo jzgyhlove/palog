@@ -546,13 +546,14 @@ func TestOfficialStats(t *testing.T) {
 	now := time.Now().Unix()
 
 	// Default cheap (系统概况 auto-refresh): only index-bounded aggregates —
-	// no rankings, no extras, so a large 1h row set stays fast.
-	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, false, true)
+	// no rankings, no extras, so a large 1h row set stays fast. All
+	// aggregates are bounded to the trailing hour.
+	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, false, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if def.Traffic.TotalRecords != 2 {
-		t.Fatalf("default total=%d, want 2", def.Traffic.TotalRecords)
+		t.Fatalf("default total=%d, want 2 (trailing hour)", def.Traffic.TotalRecords)
 	}
 	if len(def.IPRanking) != 0 || len(def.AppRanking) != 0 {
 		t.Fatalf("cheap path must skip rankings: ip=%d app=%d",
@@ -567,9 +568,27 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("security last hour=%d, want 2", def.Security.LastHour)
 	}
 
-	// Explicit window, no full: 流量分析 default — rankings present,
+	// Explicit window, no rank: traffic totals bounded to the window,
+	// rankings and extras skipped (this is the cost of 流量分析 without
+	// ?rank=1 — now opt-in).
+	winNoRank, err := s.OfficialStats(Counters{}, nil, now-3600, now, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winNoRank.Traffic.TotalRecords != 2 {
+		t.Fatalf("window total=%d, want 2", winNoRank.Traffic.TotalRecords)
+	}
+	if len(winNoRank.IPRanking) != 0 || len(winNoRank.AppRanking) != 0 {
+		t.Fatalf("window call without rank must skip rankings: %+v", winNoRank)
+	}
+	if winNoRank.Traffic.LastHour != winNoRank.Traffic.TotalRecords {
+		t.Fatalf("window last_hour=%d total=%d, want equal",
+			winNoRank.Traffic.LastHour, winNoRank.Traffic.TotalRecords)
+	}
+
+	// Explicit window + rank: 流量分析 default — rankings present,
 	// extras skipped, last_hour mirrors the window total.
-	custom, err := s.OfficialStats(Counters{}, nil, now-3600, now, false, false)
+	custom, err := s.OfficialStats(Counters{}, nil, now-3600, now, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +596,7 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("window total=%d, want 2", custom.Traffic.TotalRecords)
 	}
 	if len(custom.IPRanking) == 0 {
-		t.Fatalf("window call must compute ip ranking: %+v", custom)
+		t.Fatalf("ranked window call must compute ip ranking: %+v", custom)
 	}
 	if len(custom.AppRanking) != 0 {
 		t.Fatalf("window call with no appid rows: app ranking should be empty, got %+v", custom)
@@ -593,7 +612,7 @@ func TestOfficialStats(t *testing.T) {
 
 	// full=true default: 系统概况 deep-dive — rankings + extras present
 	// and bounded to the trailing hour.
-	fullDef, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, true, false)
+	fullDef, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +633,7 @@ func TestOfficialStats(t *testing.T) {
 	}
 
 	// Out-of-range window: counts fall back to 0, no full-table scan.
-	none, err := s.OfficialStats(Counters{}, nil, now-100000, now-99000, false, false)
+	none, err := s.OfficialStats(Counters{}, nil, now-100000, now-99000, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +643,7 @@ func TestOfficialStats(t *testing.T) {
 	}
 
 	// Device scope still applies to the default path.
-	scoped, err := s.OfficialStats(Counters{}, []string{"fw-1"}, 0, 0, true, false)
+	scoped, err := s.OfficialStats(Counters{}, []string{"fw-1"}, 0, 0, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}

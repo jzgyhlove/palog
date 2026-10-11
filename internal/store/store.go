@@ -69,11 +69,11 @@ type LogQuery struct {
 	Order   string // asc | desc
 }
 
-// OfficialStats is a compact payload for the official-style pages. With
-// full=true (opt-in deep-dive), the overview extras (TopDomains/TopSrcIP/
-// ByDevice/Recent) are computed, bounded to the same from/to window (or the
-// trailing hour when no window is given); 流量分析 passes from/to and only
-// needs traffic/security/IP/app rankings.
+// OfficialStats is a compact payload for the official-style pages.
+// IPRanking/AppRanking are computed when rank=true (流量分析); the overview
+// extras (TopDomains/TopSrcIP/ByDevice/Recent) are computed when full=true
+// (系统概况 deep-dive), bounded to the same from/to window (or the trailing
+// hour when no window is given).
 type OfficialStats struct {
 	Traffic struct {
 		TotalRecords int64            `json:"total_records"`
@@ -277,6 +277,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_domain ON logs(domain);
 CREATE INDEX IF NOT EXISTS idx_logs_device ON logs(device);
 CREATE INDEX IF NOT EXISTS idx_logs_ts_kind ON logs(ts, kind);
 CREATE INDEX IF NOT EXISTS idx_logs_ts_device ON logs(ts, device);
+CREATE INDEX IF NOT EXISTS idx_logs_ts_appid ON logs(ts, appid);
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -831,19 +832,18 @@ func (s *Store) topValues(col string, n int, where string, args []interface{}) (
 // either is set, "last_hour" is reported as the whole-window total so it
 // stays consistent with the caller's chosen range.
 //
-// full/cheap select which aggregates are computed:
-//   - full=false, cheap=false (explicit window, 流量分析): traffic totals,
-//     by_kind, security, plus the LIMIT-20 IP/app rankings. No unbounded
-//     GROUP BYs, so a custom range never triggers extra full-range scans.
-//   - full=false, cheap=true (bare 系统概况 auto-refresh): only the
-//     index-bounded set — traffic totals (+LASTHOUR index scan), by_kind
-//     (a handful of kinds, partial index scan via idx_logs_ts_kind) and
-//     the security section. Rankings and the heavy extras are skipped,
-//     which is what keeps the default 1h view fast on large tables.
+// cheap / rank / full select which aggregates are computed:
+//   - cheap=true (bare 系统概况 auto-refresh): only the index-bounded set —
+//     trailing-hour COUNT via idx_logs_ts, by_kind via the handful-of-kinds
+//     partial scan, and the security section. No full-table scan, no
+//     rankings, no group-bys: this is what keeps the default 1h view fast
+//     on a large table.
+//   - rank=true (流量分析): the cheap set plus the LIMIT-20 IP/app
+//     rankings (by_bytes / by_count scans bounded by the window).
 //   - full=true (opt-in deep-dive, ?full=1): adds the heavy overview
 //     extras (top domains/src_ip, by device, recent rows) bounded to the
 //     window, or to the trailing hour when no window is given.
-func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full, cheap bool) (*OfficialStats, error) {
+func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full, rank, cheap bool) (*OfficialStats, error) {
 	out := &OfficialStats{}
 	out.Security.ParseErrors = c.ParseErrors
 
@@ -862,27 +862,46 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	}
 	hasWindow := from > 0 || to > 0
 
-	// baseWhere: device scope + optional ts window.
+	// cheap (no explicit window): aggregates are all bounded to the
+	// trailing hour via idx_logs_ts so the default 概况 call never touches
+	// the full table. Windowed calls aggregate over the caller's window.
+	effCond := timeCond
+	effArgs := timeArgs
+	if cheap {
+		cutoff := time.Now().Unix() - 3600
+		if effCond == "" {
+			effCond = " AND ts >= ?"
+			effArgs = []interface{}{cutoff}
+		} else {
+			effCond += " AND ts >= ?"
+			effArgs = append([]interface{}{}, effArgs...)
+			effArgs = append(effArgs, cutoff)
+		}
+	}
+
+	// baseWhere: device scope + effective ts window.
 	baseWhere := ""
 	baseArgs := []interface{}{}
 	if scope != "" {
 		baseWhere = " WHERE " + scope
 		baseArgs = append(baseArgs, sargs...)
 	}
-	if timeCond != "" {
+	if effCond != "" {
 		if baseWhere == "" {
-			baseWhere = " WHERE 1=1" + timeCond
+			baseWhere = " WHERE 1=1" + effCond
 		} else {
-			baseWhere += timeCond
+			baseWhere += effCond
 		}
-		baseArgs = append(baseArgs, timeArgs...)
+		baseArgs = append(baseArgs, effArgs...)
 	}
 
-	// lastHourWhere: trailing-hour guard, only used when no window is given.
+	// lastHourWhere: trailing-hour guard, used when no window is given.
 	// When a window is given, LastHour is set to the window total instead.
+	// On the cheap path baseWhere already carries the trailing-hour bound,
+	// so no extra guard is needed.
 	lastHourWhere := baseWhere
 	lastHourArgs := append([]interface{}{}, baseArgs...)
-	if !hasWindow {
+	if !hasWindow && !cheap {
 		if lastHourWhere == "" {
 			lastHourWhere = " WHERE ts >= ?"
 			lastHourArgs = []interface{}{time.Now().Unix() - 3600}
@@ -892,10 +911,12 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		}
 	}
 
+	// Traffic totals + by_kind over the effective window. by_kind stays
+	// bounded even without a ts guard: there are only a handful of kinds,
+	// so the GROUP BY runs a small partial scan regardless of table size.
 	traffic := func() error {
 		var total int64
 		var bytesIn, bytesOut int64
-		// First aggregate everything, then by kind.
 		if err := s.db.QueryRow(
 			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+baseWhere,
 			baseArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
@@ -913,9 +934,6 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			}
 		}
 
-	// by kind. Bounded even without a ts guard: there are only a handful
-	// of kinds, so the GROUP BY runs a small partial scan regardless of
-	// table size — this is what lets the default 系统概况 call stay cheap.
 		out.Traffic.ByKind = map[string]int64{}
 		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+baseWhere+" GROUP BY kind", baseArgs...)
 		if err != nil {
@@ -945,20 +963,35 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		}
 	}
 
-	// IP/app rankings are always computed: they are the primary payload of
-	// 流量分析 (which passes explicit from/to windows) and each stays
-	// bounded by its LIMIT 20 cap. The default 系统概况 call omits them
-	// via the cheap-path flag below.
-	if !cheap {
+	// IP/app rankings: the primary payload of 流量分析 (explicit from/to
+	// windows, rank=true). Bounded by their LIMIT 20 caps; the bare
+	// 系统概况 call (cheap=true) omits them. Without an explicit window a
+	// deep-dive (full=true, no from/to) bounds the rankings to the
+	// trailing hour like the extras, so a bare ?full=1 call cannot scan
+	// the whole history.
+	rankCond := timeCond
+	rankArgs := timeArgs
+	if !hasWindow && !cheap {
+		cutoff := time.Now().Unix() - 3600
+		if rankCond == "" {
+			rankCond = " AND ts >= ?"
+			rankArgs = []interface{}{cutoff}
+		} else {
+			rankCond += " AND ts >= ?"
+			rankArgs = append([]interface{}{}, rankArgs...)
+			rankArgs = append(rankArgs, cutoff)
+		}
+	}
+	if rank {
 		ipWhere := " WHERE (src_ip != '' OR dst_ip != '')"
 		ipArgs := []interface{}{}
 		if scope != "" {
 			ipWhere += " AND " + scope
 			ipArgs = append(ipArgs, sargs...)
 		}
-		if timeCond != "" {
-			ipWhere += timeCond
-			ipArgs = append(ipArgs, timeArgs...)
+		if rankCond != "" {
+			ipWhere += rankCond
+			ipArgs = append(ipArgs, rankArgs...)
 		}
 		rows, err := s.db.Query(
 			"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
@@ -981,16 +1014,17 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			return nil, err
 		}
 
-		// App ranking by appid count, excluding unknown (-1)
+		// App ranking by appid count, excluding unknown (-1). Served by
+		// idx_logs_ts_appid over the window.
 		appWhere := " WHERE appid >= 0"
 		appArgs := []interface{}{}
 		if scope != "" {
 			appWhere += " AND " + scope
 			appArgs = append(appArgs, sargs...)
 		}
-		if timeCond != "" {
-			appWhere += timeCond
-			appArgs = append(appArgs, timeArgs...)
+		if rankCond != "" {
+			appWhere += rankCond
+			appArgs = append(appArgs, rankArgs...)
 		}
 		appRows, err := s.db.Query(
 			"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
@@ -1027,7 +1061,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	if full {
 		extraWhere := baseWhere
 		extraArgs := append([]interface{}{}, baseArgs...)
-		if !hasWindow {
+		if !hasWindow && !cheap {
 			// 概况 deep-dive with no explicit window: bound the extras to
 			// the trailing hour so the call stays a cheap index scan.
 			cutoff := time.Now().Unix() - 3600
