@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -625,6 +626,26 @@ func (s *Server) handleRetention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"deleted": deleted})
+}
+
+// LoadAppNames reads the embedded web/app_names.json and installs it as the
+// authoritative store.AppNames table. Call once at startup, before serving.
+func LoadAppNames() int {
+	f, err := web.FS.Open("app_names.json")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return 0
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return 0
+	}
+	store.SetAppNames(m)
+	return len(m)
 }
 
 // ServeStaticFiles proxies embed.FS overhead through fs.FS for tests.

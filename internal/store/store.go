@@ -152,27 +152,67 @@ const DefaultDevice = "panabit"
 
 // AppNames maps Panabit application IDs to the names the official Panabit
 // log system displays (the official UI renders `appname`, not the bare ID).
-// The full official list is not distributable, so this covers the commonly
-// observed IDs; unknown appids render as "App <id>" in the UI.
-var AppNames = map[int]string{
-	0:   "Other",
-	1:   "TCP",
-	2:   "UDP",
-	5:   "DNS",
-	6:   "SSH",
-	10:  "NTP",
-	16:  "ICMP",
-	186: "HTTP",
-	20:  "HTTPS",
-	23:  "SMTP",
-	26:  "Telnet",
-	384: "Bittorrent",
-	446: "Skype",
-	454: "P2P",
-	559: "FTP",
-	637: "POP3",
-	714: "HTTP-Alt",
-	839: "IM",
+// The full table is embedded from web/app_names.json (generated from the
+// official Panabit app dictionary); this package loads it at init.
+var AppNames map[int]string
+
+func init() {
+	// app_names.json is embedded next to the web package; the store package
+	// cannot embed it directly (embed must be in the same directory tree),
+	// so we accept the map via SetAppNames from the api layer, and default
+	// to a small built-in set here to keep the backend working standalone.
+	AppNames = map[int]string{
+		0:   "未知应用",
+		1:   "WWW",
+		2:   "SSH",
+		3:   "Telnet",
+		4:   "FTP",
+		5:   "其它HTTPS",
+		6:   "DNS",
+		7:   "SMTP",
+		8:   "DHCP",
+		9:   "TFTP",
+		10:  "SNMP",
+		11:  "BGP",
+		12:  "L2TP",
+		13:  "PPTP",
+		14:  "NFS",
+		15:  "NNTP",
+		16:  "NTP",
+		17:  "CVS",
+		18:  "POP3",
+		19:  "NETBIOS",
+		20:  "Bittorrent",
+		23:  "SMTP",
+		26:  "Telnet",
+		186: "HTTP",
+		384: "Bittorrent",
+		446: "Skype",
+		454: "P2P",
+		559: "FTP",
+		637: "POP3",
+		714: "HTTP-Alt",
+		839: "IM",
+	}
+}
+
+// SetAppNames overrides AppNames with the full dictionary loaded from
+// web/app_names.json. The api layer calls this at startup.
+func SetAppNames(m map[string]string) {
+	if len(m) == 0 {
+		return
+	}
+	nn := make(map[int]string, len(m))
+	for k, v := range m {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		nn[id] = v
+	}
+	if len(nn) > 0 {
+		AppNames = nn
+	}
 }
 
 // AppNameOf returns the known name for an appid, or "" if the id is

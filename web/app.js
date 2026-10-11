@@ -73,37 +73,40 @@ function devBadge(name) {
   return '<span class="badge dev">' + esc(name) + '</span>';
 }
 
-// appid → appname mapping, mirroring store.AppNames in
-// internal/store/store.go (the official Panabit app-name table).
-const APP_NAME_MAP = {
+/* appid → appname mapping. Authoritative source: web/app_names.json,
+ * generated from the official Panabit app dictionary (axp_merge.dic, UTF-16LE).
+ * Loaded at startup; fallback to "App <id>" for unmapped ids. */
+let APP_NAMES = null; // Map<appid(string), name> or null if not yet loaded
+
+async function loadAppNames() {
+  try {
+    const res = await fetch('/app_names.json', { cache: 'force-cache' });
+    if (!res.ok) return;
+    const obj = await res.json();
+    APP_NAMES = new Map(Object.entries(obj));
+  } catch (e) { /* keep hardcoded fallback below */ }
+}
+
+/* Small hardcoded fallback for when the JSON fails to load (offline/embedded). */
+const APP_NAME_FALLBACK = {
   0: 'Other',
-  1: 'TCP',
-  2: 'UDP',
+  1: 'WWW',
+  2: 'SSH',
   5: 'DNS',
-  6: 'SSH',
   10: 'NTP',
-  16: 'ICMP',
   20: 'HTTPS',
-  23: 'SMTP',
-  26: 'Telnet',
-  186: 'HTTP',
-  384: 'Bittorrent',
-  446: 'Skype',
-  454: 'P2P',
-  559: 'FTP',
-  637: 'POP3',
-  714: 'HTTP-Alt',
-  839: 'IM',
 };
+
 function appNameOf(appid) {
   if (appid == null || appid < 0) return '';
-  return APP_NAME_MAP[appid] || '';
+  if (APP_NAMES && APP_NAMES.has(String(appid))) return APP_NAMES.get(String(appid));
+  return APP_NAME_FALLBACK[appid] || '';
 }
 
 function appidBadge(appid) {
   if (appid == null || appid < 0) return '<span class="faint">-</span>';
   const name = appNameOf(appid);
-  const label = name ? name + ' (' + appid + ')' : String(appid);
+  const label = name ? name + ' (' + appid + ')' : 'App ' + appid;
   return '<span class="badge appid" title="' + esc(String(appid)) + '">' + esc(label) + '</span>';
 }
 
@@ -367,7 +370,7 @@ async function renderDrawer(item) {
     ['目的地址', item.dst_ip ? item.dst_ip + (item.dst_port ? ':' + item.dst_port : '') : ''],
     ['协议', item.proto === 6 ? 'TCP(6)' : item.proto === 17 ? 'UDP(17)' : (item.proto || '')],
     ['MAC', item.mac], ['接口', item.iface], ['对端接口', item.iface2],
-    ['应用 ID', item.appid >= 0 ? item.appid : ''],
+    ['应用 ID', item.appid >= 0 ? (appNameOf(item.appid) ? appNameOf(item.appid) + ' (' + item.appid + ')' : String(item.appid)) : ''],
     ['域名', item.domain], ['Host', item.host], ['路径', item.path],
     ['方法', item.method], ['用户', item.user],
     ['流入字节', item.bytes_in], ['流出字节', item.bytes_out],
@@ -1190,6 +1193,9 @@ setupAuth().then(() => {
   queryState.timeSet = true;
   runQuery();
 });
+
+// load full app dictionary in background; badges render with fallback until ready
+loadAppNames();
 
 // auto refresh: dashboard 10s, live 5s, system view when visible
 setInterval(() => { if (!document.hidden && ME) refreshLive(); }, 5000);

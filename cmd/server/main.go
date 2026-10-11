@@ -71,6 +71,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Load the full Panabit app dictionary (web/app_names.json) into the
+	// store so app-ranking and log-detail views show real app names.
+	if n := api.LoadAppNames(); n > 0 {
+		slog.Info("app dictionary loaded", "entries", n)
+	}
+
 	rx := receiver.New(st, 4096)
 	go func() {
 		if err := rx.Run(ctx); err != nil {
