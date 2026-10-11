@@ -274,6 +274,16 @@ pre.raw {
 }
 .inline-select:focus { border-color: var(--accent-2); }
 
+/* ---------- flow / security summary cells ---------- */
+.kv-flow { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.flow-cell {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 5px;
+  padding: 12px 14px;
+}
+.flow-cell b { display: block; font-family: var(--mono); font-size: 20px; letter-spacing: -.4px; margin-bottom: 4px; }
+.flow-cell span { color: var(--text-dim); font-size: 11.5px; }
+@media (max-width: 720px) { .kv-flow { grid-template-columns: 1fr; } }
+
 /* ---------- device badge ---------- */
 .badge.dev { background: rgba(34,211,238,.08); color: var(--accent); border: 1px solid rgba(34,211,238,.28); font-weight: 500; }
 .ok-txt { color: var(--ok); font-size: 12px; }

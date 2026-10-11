@@ -317,7 +317,20 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 		}
 		scope = []string{d}
 	}
-	off, err := s.Store.OfficialStats(s.counters(), scope)
+	// Optional time window: ?from=&to= (unix seconds) bound the aggregates.
+	// Defaults are 0 so a bare call aggregates the full history.
+	q := r.URL.Query()
+	from, err := parseTimeParam(q.Get("from"), 0)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	to, err := parseTimeParam(q.Get("to"), 0)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	off, err := s.Store.OfficialStats(s.counters(), scope, from, to)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

@@ -275,14 +275,6 @@ function fromDTLocal(v) {
   return isNaN(t) ? 0 : Math.floor(t / 1000);
 }
 
-/* 日志查询默认时间窗:最近 1 小时(至 = 现在,向上取整到分钟以覆盖当前分钟) */
-function defaultLogWindow() {
-  const now = Math.floor(Date.now() / 1000);
-  const to = Math.ceil(now / 60) * 60;
-  $('f-from').value = toDTLocal(now - 3600);
-  $('f-to').value = toDTLocal(to);
-}
-
 /* ---------------- device filter ---------------- */
 let DEVICES = []; // visible devices (server already scoped by role)
 
@@ -293,8 +285,10 @@ async function refreshDevices() {
     const opts = (['<option value="">全部设备</option>']).concat(
       DEVICES.map(d => '<option value="' + esc(d.name) + '">' + esc(d.name) + (d.enabled ? '' : ' (已禁用)') + '</option>')
     ).join('');
-    $('f-device').innerHTML = opts;
-    $('d-device').innerHTML = opts;
+    ['d-device', 'au-device', 'an-device'].forEach(id => {
+      const el = $(id);
+      if (el) el.innerHTML = opts;
+    });
   } catch (e) { /* 401 handled globally */ }
 }
 
@@ -305,17 +299,9 @@ function switchView(name) {
   document.querySelectorAll('.view').forEach(v => {
     v.classList.toggle('active', v.id === 'view-' + name);
   });
-  if (name === 'logs') {
-    // 打开日志查询页时:若未显式设置过时间窗,默认最近 1 小时并自动加载
-    if (!queryState.timeSet) {
-      defaultLogWindow();
-      queryState.timeSet = true;
-    }
-    runQuery();
-  }
+  if (name === 'dash') refreshDash();
   if (name === 'sys') refreshSys();
-  if (name === 'overview') refreshOverview();
-  if (name === 'audit') refreshAudit();
+  if (name === 'audit') runAuditQuery();
   if (name === 'analysis') refreshAnalysis();
 }
 document.querySelectorAll('nav.tabs button').forEach(b =>
@@ -479,12 +465,13 @@ function recentRow(item) {
 async function refreshDash() {
   try {
     const dev = $('d-device').value;
-    const params = new URLSearchParams();
-    if (dev) params.set('device', dev);
-    const qs = params.toString();
-    const s = await api('/api/stats' + (qs ? '?' + qs : ''));
-    $('s-total').textContent = fmtNum(s.total);
-    $('s-hour').textContent = fmtNum(s.last_hour);
+    const from = fromDTLocal($('d-from').value) || 0;
+    const to = fromDTLocal($('d-to').value) || 0;
+    // stats: live counters + recent records (no time param — last-24h window
+    // on the server, plus real-time pps). Keep the live view.
+    const sp = new URLSearchParams();
+    if (dev) sp.set('device', dev);
+    const s = await api('/api/stats' + (sp.toString() ? '?' + sp.toString() : ''));
     $('s-pps').innerHTML = s.pps.toFixed(2) + ' <small>包/秒</small>';
     $('s-pkts').innerHTML = fmtNum(s.packets) + ' / ' + fmtNum(s.records);
     $('s-errs').textContent = fmtNum(s.parse_errors);
@@ -501,12 +488,47 @@ async function refreshDash() {
       tb.innerHTML = '';
       $('s-recent-empty').style.display = 'block';
     }
+
+    // official-stats: aggregates over the user-chosen time window.
+    const op = new URLSearchParams();
+    if (dev) op.set('device', dev);
+    if (from) op.set('from', from);
+    if (to) op.set('to', to);
+    const o = await api('/api/official-stats?' + op.toString());
+    $('s-total').textContent = fmtNum(o.traffic.total_records);
+    $('s-hour').textContent = fmtNum(o.traffic.last_hour);
+    $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流出</small>';
+    $('ov-tr-down').innerHTML = fmtBytes(o.traffic.bytes_in) + ' <small>流入</small>';
+    $('ov-sec-err').textContent = fmtNum(o.security.parse_errors);
+    $('ov-sec-hour').textContent = fmtNum(o.security.last_hour);
   } catch (err) {
-    if (err.message !== 'unauthorized') toast('仪表盘加载失败: ' + err.message, true);
+    if (err.message !== 'unauthorized') toast('系统概况加载失败: ' + err.message, true);
   }
 }
 
 $('d-device').addEventListener('change', refreshDash);
+['d-from', 'd-to'].forEach(id => $(id).addEventListener('change', refreshDash));
+
+/* 系统概况 time-range presets */
+function applyDashRangePreset() {
+  const v = $('d-range').value;
+  const now = Math.floor(Date.now() / 1000);
+  const to = Math.ceil(now / 60) * 60;
+  if (v === 'custom') { /* user editing the datetime inputs directly */
+    return;
+  }
+  if (v === '0') {
+    $('d-from').value = '';
+    $('d-to').value = '';
+  } else {
+    const sec = parseInt(v, 10);
+    $('d-from').value = toDTLocal(to - sec);
+    $('d-to').value = toDTLocal(to);
+  }
+  refreshDash();
+}
+$('d-range').addEventListener('change', applyDashRangePreset);
+$('d-search').addEventListener('click', refreshDash);
 
 /* recent table row click (event delegation) */
 document.addEventListener('click', (e) => {
@@ -520,26 +542,33 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-/* ---------------- log query ---------------- */
-const queryState = { limit: 100, offset: 0, timeSet: false };
+/* ---------------- 日志审计（含日志查询） ---------------- */
+const auditQueryState = { limit: 100, offset: 0, timeSet: false };
 
-function buildQueryParams() {
+function defaultAuditWindow() {
+  const now = Math.floor(Date.now() / 1000);
+  const to = Math.ceil(now / 60) * 60;
+  $('au-from').value = toDTLocal(now - 3600);
+  $('au-to').value = toDTLocal(to);
+}
+
+function buildAuditParams() {
   const p = new URLSearchParams();
-  const dev = $('f-device').value; if (dev) p.set('device', dev);
-  const k = $('f-kind').value; if (k) p.set('kind', k);
-  const q = $('f-q').value.trim(); if (q) p.set('q', q);
-  const s = $('f-src').value.trim(); if (s) p.set('src_ip', s);
-  const d = $('f-dst').value.trim(); if (d) p.set('dst_ip', d);
-  const dom = $('f-domain').value.trim(); if (dom) p.set('domain', dom);
-  const from = fromDTLocal($('f-from').value); if (from) p.set('from', from);
-  const to = fromDTLocal($('f-to').value); if (to) p.set('to', to);
-  p.set('order', $('f-order').value);
-  p.set('limit', queryState.limit);
-  p.set('offset', queryState.offset);
+  const dev = $('au-device').value; if (dev) p.set('device', dev);
+  const k = $('au-kind').value; if (k) p.set('kind', k);
+  const q = $('au-q').value.trim(); if (q) p.set('q', q);
+  const s = $('au-src').value.trim(); if (s) p.set('src_ip', s);
+  const d = $('au-dst').value.trim(); if (d) p.set('dst_ip', d);
+  const dom = $('au-domain').value.trim(); if (dom) p.set('domain', dom);
+  const from = fromDTLocal($('au-from').value); if (from) p.set('from', from);
+  const to = fromDTLocal($('au-to').value); if (to) p.set('to', to);
+  p.set('order', $('au-order').value);
+  p.set('limit', auditQueryState.limit);
+  p.set('offset', auditQueryState.offset);
   return p;
 }
 
-function logRow(item, idx) {
+function auditRow(item) {
   const target = item.kind === 'dnsquery' ? item.domain
     : item.kind === 'http' ? item.host
       : item.kind === 'qqlogin' ? item.user
@@ -560,61 +589,60 @@ function logRow(item, idx) {
     '</tr>';
 }
 
-async function runQuery() {
-  const tb = $('l-body');
+async function runAuditQuery() {
+  const tb = $('au-body');
   tb.innerHTML = '<tr><td colspan="10"><div class="empty"><span class="spin" style="vertical-align:-2px;margin-right:8px;"></span>查询中…</div></td></tr>';
-  $('l-loading').style.display = 'inline-block';
-  $('l-prev').disabled = true;
-  $('l-next').disabled = true;
+  $('au-loading').style.display = 'inline-block';
+  $('au-prev').disabled = true;
+  $('au-next').disabled = true;
   try {
-    const r = await api('/api/logs?' + buildQueryParams().toString());
+    const r = await api('/api/logs?' + buildAuditParams().toString());
     const items = r.items || [];
-    $('l-total').textContent = r.total;
-    $('l-page').textContent = Math.floor(r.offset / r.limit) + 1;
-    $('l-empty').style.display = items.length ? 'none' : 'block';
-    tb.innerHTML = items.map(logRow).join('');
-    $('l-prev').disabled = queryState.offset <= 0;
-    $('l-next').disabled = queryState.offset + items.length >= r.total;
+    $('au-total').textContent = r.total;
+    $('au-page').textContent = Math.floor(r.offset / r.limit) + 1;
+    $('au-empty').style.display = items.length ? 'none' : 'block';
+    tb.innerHTML = items.map(auditRow).join('');
+    $('au-prev').disabled = auditQueryState.offset <= 0;
+    $('au-next').disabled = auditQueryState.offset + items.length >= r.total;
   } catch (err) {
     if (err.message === 'unauthorized') return;
     tb.innerHTML = '';
-    $('l-empty').style.display = 'block';
-    $('l-empty').textContent = '查询失败: ' + err.message;
+    $('au-empty').style.display = 'block';
+    $('au-empty').textContent = '查询失败: ' + err.message;
     toast('查询失败: ' + err.message, true);
   } finally {
-    $('l-loading').style.display = 'none';
+    $('au-loading').style.display = 'none';
   }
 }
 
 /* debounce q */
-let qTimer = null;
-$('f-q').addEventListener('input', () => {
-  clearTimeout(qTimer);
-  qTimer = setTimeout(() => { queryState.offset = 0; runQuery(); }, 300);
+let auQTimer = null;
+$('au-q').addEventListener('input', () => {
+  clearTimeout(auQTimer);
+  auQTimer = setTimeout(() => { auditQueryState.offset = 0; runAuditQuery(); }, 300);
 });
-$('f-search').addEventListener('click', () => { queryState.offset = 0; runQuery(); });
-$('f-kind').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
-$('f-order').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
-$('f-device').addEventListener('change', () => { queryState.offset = 0; runQuery(); });
-['f-src', 'f-dst', 'f-domain', 'f-from', 'f-to'].forEach(id =>
-  $(id).addEventListener('change', () => { queryState.offset = 0; runQuery(); }));
-$('l-prev').addEventListener('click', () => {
-  queryState.offset = Math.max(0, queryState.offset - queryState.limit);
-  runQuery();
+$('au-search').addEventListener('click', () => { auditQueryState.offset = 0; runAuditQuery(); });
+$('au-kind').addEventListener('change', () => { auditQueryState.offset = 0; runAuditQuery(); });
+$('au-order').addEventListener('change', () => { auditQueryState.offset = 0; runAuditQuery(); });
+$('au-device').addEventListener('change', () => { auditQueryState.offset = 0; runAuditQuery(); });
+['au-src', 'au-dst', 'au-domain', 'au-from', 'au-to'].forEach(id =>
+  $(id).addEventListener('change', () => { auditQueryState.offset = 0; runAuditQuery(); }));
+$('au-prev').addEventListener('click', () => {
+  auditQueryState.offset = Math.max(0, auditQueryState.offset - auditQueryState.limit);
+  runAuditQuery();
 });
-$('l-next').addEventListener('click', () => {
-  queryState.offset += queryState.limit;
-  runQuery();
+$('au-next').addEventListener('click', () => {
+  auditQueryState.offset += auditQueryState.limit;
+  runAuditQuery();
 });
-$('f-reset').addEventListener('click', () => {
-  ['f-device', 'f-kind', 'f-q', 'f-src', 'f-dst', 'f-domain', 'f-order'].forEach(id => {
-    if (id === 'f-kind' || id === 'f-order') $(id).value = id === 'f-kind' ? '' : 'desc';
-    else $(id).value = '';
+$('au-reset').addEventListener('click', () => {
+  ['au-device', 'au-kind', 'au-q', 'au-src', 'au-dst', 'au-domain'].forEach(id => {
+    $(id).value = '';
   });
-  // 时间窗重置回默认最近 1 小时(而非清空 → 避免触发全表查询)
-  defaultLogWindow();
-  queryState.offset = 0;
-  runQuery();
+  $('au-order').value = 'desc';
+  defaultAuditWindow();
+  auditQueryState.offset = 0;
+  runAuditQuery();
 });
 
 /* ---------------- 系统管理: 运行状态 ---------------- */
@@ -866,81 +894,8 @@ $('c-retention').addEventListener('click', async () => {
   }
 });
 
-/* ---------------- 系统概况: 子页签 ---------------- */
-const ovSubState = { sub: 'traffic' };
-
-function switchOvSub(name) {
-  ovSubState.sub = name;
-  document.querySelectorAll('#ov-tabs button').forEach(b =>
-    b.classList.toggle('active', b.dataset.sub === name));
-  document.querySelectorAll('#view-overview .subview').forEach(v =>
-    v.classList.toggle('active', v.id === 'ov-' + name));
-  refreshOverview();
-}
-document.querySelectorAll('#ov-tabs button').forEach(b =>
-  b.addEventListener('click', () => switchOvSub(b.dataset.sub)));
-
-async function refreshOverview() {
-  const dev = $('ov-device').value;
-  const p = new URLSearchParams();
-  if (dev) p.set('device', dev);
-  try {
-    const o = await api('/api/official-stats?' + p.toString());
-    if (ovSubState.sub === 'traffic') {
-      $('ov-tr-total').textContent = fmtNum(o.traffic.total_records);
-      $('ov-tr-hour').textContent = fmtNum(o.traffic.last_hour);
-      $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流出</small>';
-      $('ov-tr-down').innerHTML = fmtBytes(o.traffic.bytes_in) + ' <small>流入</small>';
-      kindShareOv(o.traffic.by_kind);
-    }
-    if (ovSubState.sub === 'security') {
-      $('ov-sec-err').textContent = fmtNum(o.security.parse_errors);
-      $('ov-sec-hour').textContent = fmtNum(o.security.last_hour);
-      renderSecurityEvents(o);
-    }
-  } catch (err) {
-    if (err.message !== 'unauthorized') toast('系统概况加载失败: ' + err.message, true);
-  }
-}
-
-function kindShareOv(byKind) {
-  const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话', qqlogin: 'QQ 登录' };
-  const entries = Object.entries(byKind || {}).map(([k, v]) =>
-    [names[k] || k, v]).sort((a, b) => b[1] - a[1]);
-  const el = $('ov-tr-kinds');
-  if (entries.length === 0) { el.innerHTML = '<div class="h-empty">暂无数据</div>'; return; }
-  const total = entries.reduce((s, e) => s + e[1], 0) || 1;
-  el.innerHTML = entries.map(([k, v]) => {
-    const pct = Math.round(v / total * 100);
-    return '<div class="bar-row">' +
-      '<span class="key" style="font-family:var(--sans)">' + esc(k) + '</span>' +
-      '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>' +
-      '<span class="cnt">' + fmtNum(v) + ' (' + pct + '%)</span></div>';
-  }).join('');
-}
-
-function renderSecurityEvents(o) {
-  const el = $('ov-sec-events');
-  const items = [];
-  items.push({ label: '解析错误总数', value: o.security.parse_errors, badge: 'proto' });
-  items.push({ label: '最近 1 小时记录', value: o.security.last_hour, badge: 'dev' });
-  const byKind = o.traffic.by_kind || {};
-  Object.entries(byKind).forEach(([k, v]) => {
-    const names = { dnsquery: 'DNS 查询', http: 'HTTP 会话', session: '协议会话', qqlogin: 'QQ 登录' };
-    items.push({ label: names[k] || k, value: v, badge: 'sess' });
-  });
-  el.innerHTML = items.map(it =>
-    '<div class="bar-row">' +
-    '<span class="key" style="font-family:var(--sans)">' + esc(it.label) + '</span>' +
-    '<div class="track"><div class="fill" style="width:100%;opacity:.25"></div></div>' +
-    '<span class="cnt">' + fmtNum(it.value) + '</span></div>'
-  ).join('');
-}
-
-// sync device selector
-$('ov-device').addEventListener('change', refreshOverview);
 document.addEventListener('palog:me', () => { refreshDevices(); });
-// inject ov-device, au-device, an-device into device list refresh
+// inject au-device, an-device into device list refresh (d-device handled by refreshDevices above)
 (function patchRefreshDevices() {
   const orig = refreshDevices;
   refreshDevices = async function() {
@@ -949,7 +904,7 @@ document.addEventListener('palog:me', () => { refreshDevices(); });
       const opts = ['<option value="">全部设备</option>'].concat(
         DEVICES.map(d => '<option value="' + esc(d.name) + '">' + esc(d.name) + (d.enabled ? '' : ' (已禁用)') + '</option>')
       ).join('');
-      ['ov-device', 'au-device', 'an-device'].forEach(id => {
+      ['au-device', 'an-device'].forEach(id => {
         const el = $(id);
         if (el) el.innerHTML = opts;
       });
@@ -957,160 +912,7 @@ document.addEventListener('palog:me', () => { refreshDevices(); });
   };
 })();
 
-/* ---------------- 日志审计: 子页签 ---------------- */
-const auditState = {
-  sub: 'session',
-  session: { limit: 50, offset: 0 },
-  url:     { limit: 50, offset: 0 },
-  dns:     { limit: 50, offset: 0 },
-  identity:{ limit: 50, offset: 0 },
-};
-
-function switchAuSub(name) {
-  auditState.sub = name;
-  document.querySelectorAll('#au-tabs button').forEach(b =>
-    b.classList.toggle('active', b.dataset.sub === name));
-  document.querySelectorAll('#view-audit .subview').forEach(v =>
-    v.classList.toggle('active', v.id === 'au-' + name));
-  refreshAudit();
-}
-document.querySelectorAll('#au-tabs button').forEach(b =>
-  b.addEventListener('click', () => switchAuSub(b.dataset.sub)));
-
-$('au-device').addEventListener('change', refreshAudit);
-
-function auditBaseParams() {
-  const p = new URLSearchParams();
-  const dev = $('au-device').value; if (dev) p.set('device', dev);
-  return p;
-}
-
-async function fetchAuditPage(tab, kind) {
-  const st = auditState[tab];
-  const p = auditBaseParams();
-  if (kind) p.set('kind', kind);
-  p.set('limit', st.limit);
-  p.set('offset', st.offset);
-  p.set('order', 'desc');
-  const r = await api('/api/logs?' + p.toString());
-  return r;
-}
-
-async function refreshAudit() {
-  const tab = auditState.sub;
-  const body = $('au-' + tab + '-body');
-  const empty = $('au-' + tab + '-empty');
-  const totalEl = $('au-' + tab + '-total');
-  const pageEl = $('au-' + tab + '-page');
-  body.innerHTML = '<tr><td colspan="9"><div class="empty"><span class="spin" style="vertical-align:-2px;margin-right:8px;"></span>加载…</div></td></tr>';
-  try {
-    let r;
-    switch (tab) {
-      case 'session':
-        // show both binary session and HTTP logs
-        r = await fetchAuditPage('session', 'session');
-        renderAuditTable(body, empty, totalEl, pageEl, 'session', r, auditSessionRow);
-        break;
-      case 'url':
-        r = await fetchAuditPage('url', 'http');
-        renderAuditTable(body, empty, totalEl, pageEl, 'url', r, auditUrlRow);
-        break;
-      case 'dns':
-        r = await fetchAuditPage('dns', 'dnsquery');
-        renderAuditTable(body, empty, totalEl, pageEl, 'dns', r, auditDnsRow);
-        break;
-      case 'identity':
-        r = await fetchAuditPage('identity', 'qqlogin');
-        renderAuditTable(body, empty, totalEl, pageEl, 'identity', r, auditIdentityRow);
-        break;
-    }
-  } catch (err) {
-    if (err.message === 'unauthorized') return;
-    body.innerHTML = '';
-    empty.style.display = 'block';
-    empty.textContent = '查询失败: ' + err.message;
-    toast('日志审计加载失败: ' + err.message, true);
-  }
-}
-
-function renderAuditTable(body, empty, totalEl, pageEl, tab, r, rowFn) {
-  const items = r.items || [];
-  const st = auditState[tab];
-  totalEl.textContent = r.total;
-  pageEl.textContent = Math.floor(st.offset / st.limit) + 1;
-  empty.style.display = items.length ? 'none' : 'block';
-  body.innerHTML = items.map(rowFn).join('');
-  $('au-' + tab + '-prev').disabled = st.offset <= 0;
-  $('au-' + tab + '-next').disabled = st.offset + items.length >= r.total;
-}
-
-function auditSessionRow(item) {
-  const target = item.kind === 'session' ? (item.domain || item.host || '') : (item.host || '');
-  const path = item.kind === 'http' ? item.path : '';
-  const id = item.id;
-  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
-    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
-    '<td>' + devBadge(item.device) + '</td>' +
-    '<td>' + kindBadge(item.kind) + '</td>' +
-    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
-    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
-    '<td>' + protoBadge(item.proto) + '</td>' +
-    '<td class="mono trunc">' + esc(target) + '</td>' +
-    '<td class="mono trunc wide">' + esc(path) + '</td>' +
-    '<td>' + appidBadge(item.appid) + '</td>' +
-    '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
-    '</tr>';
-}
-
-function auditUrlRow(item) {
-  const id = item.id;
-  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
-    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
-    '<td>' + devBadge(item.device) + '</td>' +
-    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
-    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
-    '<td class="mono">' + esc(item.method || '-') + '</td>' +
-    '<td class="mono trunc">' + esc(item.host || '') + '</td>' +
-    '<td class="mono trunc wide">' + esc(item.path || '') + '</td>' +
-    '<td>' + appidBadge(item.appid) + '</td>' +
-    '<td class="mono dim">' + esc(item.user || '-') + '</td>' +
-    '</tr>';
-}
-
-function auditDnsRow(item) {
-  const id = item.id;
-  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
-    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
-    '<td>' + devBadge(item.device) + '</td>' +
-    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
-    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
-    '<td class="mono trunc wide">' + esc(item.domain || '') + '</td>' +
-    '<td class="mono dim">' + esc(item.user || '-') + '</td>' +
-    '</tr>';
-}
-
-function auditIdentityRow(item) {
-  const id = item.id;
-  return '<tr class="row-link" tabindex="0" data-id="' + id + '">' +
-    '<td class="mono dim nowrap">' + esc(fmtTime(item.ts)) + '</td>' +
-    '<td>' + devBadge(item.device) + '</td>' +
-    '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
-    '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
-    '<td class="mono">' + esc(item.user || '-') + '</td>' +
-    '</tr>';
-}
-
-// wire audit pagination
-['session', 'url', 'dns', 'identity'].forEach(tab => {
-  $('au-' + tab + '-prev').addEventListener('click', () => {
-    auditState[tab].offset = Math.max(0, auditState[tab].offset - auditState[tab].limit);
-    refreshAudit();
-  });
-  $('au-' + tab + '-next').addEventListener('click', () => {
-    auditState[tab].offset += auditState[tab].limit;
-    refreshAudit();
-  });
-});
+/* ---------------- 日志审计: 已合并进上方 runAuditQuery 统一查询框 ---------------- */
 
 /* ---------------- 流量分析: 子页签 ---------------- */
 const anSubState = { sub: 'iprank' };
@@ -1128,10 +930,34 @@ document.querySelectorAll('#an-tabs button').forEach(b =>
 
 $('an-device').addEventListener('change', refreshAnalysis);
 
+/* 流量分析 time-range presets */
+function applyAnRangePreset() {
+  const v = $('an-range').value;
+  const now = Math.floor(Date.now() / 1000);
+  const to = Math.ceil(now / 60) * 60;
+  if (v === 'custom') { return; }
+  if (v === '0') {
+    $('an-from').value = '';
+    $('an-to').value = '';
+  } else {
+    const sec = parseInt(v, 10);
+    $('an-from').value = toDTLocal(to - sec);
+    $('an-to').value = toDTLocal(to);
+  }
+  refreshAnalysis();
+}
+$('an-range').addEventListener('change', applyAnRangePreset);
+$('an-search').addEventListener('click', refreshAnalysis);
+['an-from', 'an-to'].forEach(id => $(id).addEventListener('change', refreshAnalysis));
+
 async function refreshAnalysis() {
   const dev = $('an-device').value;
+  const from = fromDTLocal($('an-from').value) || 0;
+  const to = fromDTLocal($('an-to').value) || 0;
   const p = new URLSearchParams();
   if (dev) p.set('device', dev);
+  if (from) p.set('from', from);
+  if (to) p.set('to', to);
   try {
     const o = await api('/api/official-stats?' + p.toString());
     if (anSubState.sub === 'iprank') {
@@ -1180,18 +1006,23 @@ function renderAppRanking(items) {
 
 /* ---------------- init & timers ---------------- */
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && ME) { refreshLive(); refreshDash(); }
+  if (!document.hidden && ME) {
+    refreshLive();
+    if ($('view-dash').classList.contains('active')) refreshDash();
+    if ($('view-analysis').classList.contains('active')) refreshAnalysis();
+  }
 });
 
 // auth gates everything
 setupAuth().then(() => {
   refreshLive();
-  refreshDash();
+  // default time windows: 系统概况 + 流量分析 = 最近 1 小时,日志审计 = 最近 1 小时
+  applyDashRangePreset();
+  applyAnRangePreset();
+  defaultAuditWindow();
+  auditQueryState.timeSet = true;
+  runAuditQuery();
   refreshDevices();
-  // 日志查询默认最近 1 小时,避免启动即全表查询
-  defaultLogWindow();
-  queryState.timeSet = true;
-  runQuery();
 });
 
 // load full app dictionary in background; badges render with fallback until ready

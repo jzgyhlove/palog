@@ -49,12 +49,10 @@
 <header>
   <div class="brand"><span class="dot"></span><b>palog</b><small>Panabit 日志审计</small></div>
   <nav class="tabs">
-    <button data-view="dash" class="active">仪表盘</button>
-    <button data-view="logs">日志查询</button>
-    <button data-view="sys">系统管理</button>
-    <button data-view="overview">系统概况</button>
+    <button data-view="dash" class="active">系统概况</button>
     <button data-view="audit">日志审计</button>
     <button data-view="analysis">流量分析</button>
+    <button data-view="sys">系统管理</button>
   </nav>
   <div class="header-right">
     <span class="live" id="live-dot">实时</span>
@@ -66,20 +64,53 @@
 </header>
 
 <main>
-  <!-- ======================= 仪表盘 ======================= -->
+  <!-- ======================= 系统概况（含仪表盘） ======================= -->
   <section class="view active" id="view-dash">
-    <h2>仪表盘
+    <h2>系统概况
       <select id="d-device" class="inline-select" title="按设备查看（留空 = 所有可访问设备）">
         <option value="">全部设备</option>
       </select>
     </h2>
+
+    <div class="toolbar">
+      <label>时间范围</label>
+      <label>从 <input type="datetime-local" id="d-from"></label>
+      <label>至 <input type="datetime-local" id="d-to"></label>
+      <select id="d-range" title="快捷时间">
+        <option value="3600" selected>最近 1 小时</option>
+        <option value="7200">最近 2 小时</option>
+        <option value="86400">最近 24 小时</option>
+        <option value="0">全部时间</option>
+        <option value="custom">自定义</option>
+      </select>
+      <button class="btn primary" id="d-search">查询</button>
+    </div>
+
     <div class="grid g-stats" id="stat-cards">
-      <div class="card stat"><div class="lbl">日志总数</div><div class="num" id="s-total">-</div></div>
+      <div class="card stat"><div class="lbl">记录数(范围)</div><div class="num" id="s-total">-</div></div>
       <div class="card stat"><div class="lbl">最近 1 小时</div><div class="num" id="s-hour">-</div></div>
       <div class="card stat"><div class="lbl">接收速率</div><div class="num" id="s-pps">-</div></div>
       <div class="card stat"><div class="lbl">UDP 包 / 记录</div><div class="num" id="s-pkts">-</div></div>
       <div class="card stat"><div class="lbl">解析错误</div><div class="num" id="s-errs">-</div></div>
     </div>
+
+    <div class="grid g-2" style="margin-top:14px;">
+      <div class="card">
+        <h3>流量概况</h3>
+        <div class="kv-flow">
+          <div class="flow-cell"><b id="ov-tr-up">-</b><span>上行流量(流出)</span></div>
+          <div class="flow-cell"><b id="ov-tr-down">-</b><span>下行流量(流入)</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>安全概况</h3>
+        <div class="kv-flow">
+          <div class="flow-cell"><b id="ov-sec-err">-</b><span>解析错误</span></div>
+          <div class="flow-cell"><b id="ov-sec-hour">-</b><span>范围内记录</span></div>
+        </div>
+      </div>
+    </div>
+
     <div class="grid g-3" style="margin-top:14px;">
       <div class="card">
         <h3>日志类型分布</h3>
@@ -94,6 +125,7 @@
         <div id="s-srcip"></div>
       </div>
     </div>
+
     <div class="card" style="margin-top:14px;">
       <h3>设备分布</h3>
       <div id="s-devices"></div>
@@ -115,47 +147,47 @@
     </div>
   </section>
 
-  <!-- ======================= 日志查询 ======================= -->
-  <section class="view" id="view-logs">
-    <h2>日志查询</h2>
+  <!-- ======================= 日志审计（含日志查询） ======================= -->
+  <section class="view" id="view-audit">
+    <h2>日志审计</h2>
     <div class="toolbar">
-      <select id="f-device" title="设备">
+      <select id="au-device" title="设备">
         <option value="">全部设备</option>
       </select>
-      <select id="f-kind" title="类型">
+      <select id="au-kind" title="类型">
         <option value="">全部类型</option>
-        <option value="dnsquery">DNS 查询</option>
-        <option value="http">HTTP 会话</option>
-        <option value="session">协议会话(二进制)</option>
-        <option value="qqlogin">QQ 登录</option>
+        <option value="session">会话日志</option>
+        <option value="http">URL日志</option>
+        <option value="dnsquery">DNS日志</option>
+        <option value="qqlogin">虚拟身份</option>
       </select>
-      <input class="grow" id="f-q" placeholder="全文搜索: IP / 域名 / Host / 路径 / 用户…" title="关键词">
-      <input id="f-src" placeholder="源 IP" style="width:130px;">
-      <input id="f-dst" placeholder="目的 IP" style="width:130px;">
-      <input id="f-domain" placeholder="域名" style="width:150px;">
-      <label>从 <input type="datetime-local" id="f-from"></label>
-      <label>至 <input type="datetime-local" id="f-to"></label>
-      <select id="f-order" title="排序">
+      <input class="grow" id="au-q" placeholder="全文搜索: IP / 域名 / Host / 路径 / 用户…" title="关键词">
+      <input id="au-src" placeholder="源 IP" style="width:130px;">
+      <input id="au-dst" placeholder="目的 IP" style="width:130px;">
+      <input id="au-domain" placeholder="域名" style="width:150px;">
+      <label>从 <input type="datetime-local" id="au-from"></label>
+      <label>至 <input type="datetime-local" id="au-to"></label>
+      <select id="au-order" title="排序">
         <option value="desc">最新优先</option>
         <option value="asc">最早优先</option>
       </select>
-      <button class="btn primary" id="f-search">查询</button>
-      <button class="btn" id="f-reset">重置</button>
+      <button class="btn primary" id="au-search">查询</button>
+      <button class="btn" id="au-reset">重置</button>
     </div>
     <div class="tbl-wrap"><table>
       <thead><tr>
         <th>时间</th><th>设备</th><th>类型</th><th>来源</th><th>目的</th><th>协议</th>
         <th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>流入/流出</th>
       </tr></thead>
-      <tbody id="l-body"></tbody>
+      <tbody id="au-body"></tbody>
     </table></div>
-    <div id="l-empty" class="empty" style="display:none;">没有匹配的日志。</div>
+    <div id="au-empty" class="empty" style="display:none;">没有匹配的日志。</div>
     <div class="pager">
-      <button class="btn sm" id="l-prev">‹ 上一页</button>
-      <span>共 <b id="l-total">0</b> 条 · 第 <b id="l-page">1</b> 页</span>
-      <button class="btn sm" id="l-next">下一页 ›</button>
+      <button class="btn sm" id="au-prev">‹ 上一页</button>
+      <span>共 <b id="au-total">0</b> 条 · 第 <b id="au-page">1</b> 页</span>
+      <button class="btn sm" id="au-next">下一页 ›</button>
       <span class="spacer"></span>
-      <span id="l-loading" class="spin" style="display:none;"></span>
+      <span id="au-loading" class="spin" style="display:none;"></span>
     </div>
   </section>
 
@@ -244,132 +276,6 @@
     </div>
   </section>
 
-  <!-- ======================= 系统概况 ======================= -->
-  <section class="view" id="view-overview">
-    <h2>系统概况
-      <select id="ov-device" class="inline-select" title="按设备查看">
-        <option value="">全部设备</option>
-      </select>
-    </h2>
-    <nav class="subtabs" id="ov-tabs">
-      <button data-sub="traffic" class="active">流量概况</button>
-      <button data-sub="security">安全概况</button>
-    </nav>
-
-    <div class="subview active" id="ov-traffic">
-      <div class="grid g-2">
-        <div class="card stat"><div class="lbl">总记录数</div><div class="num" id="ov-tr-total">-</div></div>
-        <div class="card stat"><div class="lbl">最近 1 小时记录</div><div class="num" id="ov-tr-hour">-</div></div>
-        <div class="card stat"><div class="lbl">上行流量</div><div class="num" id="ov-tr-up">-</div></div>
-        <div class="card stat"><div class="lbl">下行流量</div><div class="num" id="ov-tr-down">-</div></div>
-      </div>
-      <div class="card" style="margin-top:14px;">
-        <h3>按日志类型分布</h3>
-        <div id="ov-tr-kinds"></div>
-      </div>
-    </div>
-
-    <div class="subview" id="ov-security">
-      <div class="grid g-2">
-        <div class="card stat"><div class="lbl">解析错误</div><div class="num" id="ov-sec-err">-</div></div>
-        <div class="card stat"><div class="lbl">最近 1 小时记录</div><div class="num" id="ov-sec-hour">-</div></div>
-      </div>
-      <div class="card" style="margin-top:14px;">
-        <h3>事件概览</h3>
-        <div id="ov-sec-events"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================= 日志审计 ======================= -->
-  <section class="view" id="view-audit">
-    <h2>日志审计
-      <select id="au-device" class="inline-select" title="按设备查看">
-        <option value="">全部设备</option>
-      </select>
-    </h2>
-    <nav class="subtabs" id="au-tabs">
-      <button data-sub="session" class="active">会话日志</button>
-      <button data-sub="url">URL日志</button>
-      <button data-sub="dns">DNS日志</button>
-      <button data-sub="identity">虚拟身份</button>
-    </nav>
-
-    <div class="subview active" id="au-session">
-      <div class="card">
-        <h3>会话日志（二进制 PNB 会话 + HTTP）</h3>
-        <div class="tbl-wrap"><table>
-          <thead><tr>
-            <th>时间</th><th>设备</th><th>类型</th><th>来源</th><th>目的</th>
-            <th>协议</th><th>域名 / Host</th><th>路径</th><th>应用 ID</th><th>流入/流出</th>
-          </tr></thead>
-          <tbody id="au-session-body"></tbody>
-        </table></div>
-        <div id="au-session-empty" class="empty" style="display:none;">暂无会话日志。</div>
-        <div class="pager">
-          <button class="btn sm" id="au-session-prev">‹ 上一页</button>
-          <span>共 <b id="au-session-total">0</b> 条 · 第 <b id="au-session-page">1</b> 页</span>
-          <button class="btn sm" id="au-session-next">下一页 ›</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="subview" id="au-url">
-      <div class="card">
-        <h3>URL日志（HTTP）</h3>
-        <div class="tbl-wrap"><table>
-          <thead><tr>
-            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>方法</th>
-            <th>Host</th><th>路径</th><th>应用 ID</th><th>用户</th>
-          </tr></thead>
-          <tbody id="au-url-body"></tbody>
-        </table></div>
-        <div id="au-url-empty" class="empty" style="display:none;">暂无URL日志。</div>
-        <div class="pager">
-          <button class="btn sm" id="au-url-prev">‹ 上一页</button>
-          <span>共 <b id="au-url-total">0</b> 条 · 第 <b id="au-url-page">1</b> 页</span>
-          <button class="btn sm" id="au-url-next">下一页 ›</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="subview" id="au-dns">
-      <div class="card">
-        <h3>DNS日志</h3>
-        <div class="tbl-wrap"><table>
-          <thead><tr>
-            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>域名</th><th>用户</th>
-          </tr></thead>
-          <tbody id="au-dns-body"></tbody>
-        </table></div>
-        <div id="au-dns-empty" class="empty" style="display:none;">暂无DNS日志。</div>
-        <div class="pager">
-          <button class="btn sm" id="au-dns-prev">‹ 上一页</button>
-          <span>共 <b id="au-dns-total">0</b> 条 · 第 <b id="au-dns-page">1</b> 页</span>
-          <button class="btn sm" id="au-dns-next">下一页 ›</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="subview" id="au-identity">
-      <div class="card">
-        <h3>虚拟身份（QQ 登录 / 用户）</h3>
-        <div class="tbl-wrap"><table>
-          <thead><tr>
-            <th>时间</th><th>设备</th><th>来源</th><th>目的</th><th>用户 / QQ号</th>
-          </tr></thead>
-          <tbody id="au-identity-body"></tbody>
-        </table></div>
-        <div id="au-identity-empty" class="empty" style="display:none;">暂无虚拟身份日志。</div>
-        <div class="pager">
-          <button class="btn sm" id="au-identity-prev">‹ 上一页</button>
-          <span>共 <b id="au-identity-total">0</b> 条 · 第 <b id="au-identity-page">1</b> 页</span>
-          <button class="btn sm" id="au-identity-next">下一页 ›</button>
-        </div>
-      </div>
-    </div>
-  </section>
-
   <!-- ======================= 流量分析 ======================= -->
   <section class="view" id="view-analysis">
     <h2>流量分析
@@ -377,6 +283,19 @@
         <option value="">全部设备</option>
       </select>
     </h2>
+    <div class="toolbar">
+      <label>时间范围</label>
+      <label>从 <input type="datetime-local" id="an-from"></label>
+      <label>至 <input type="datetime-local" id="an-to"></label>
+      <select id="an-range" title="快捷时间">
+        <option value="3600" selected>最近 1 小时</option>
+        <option value="7200">最近 2 小时</option>
+        <option value="86400">最近 24 小时</option>
+        <option value="0">全部时间</option>
+        <option value="custom">自定义</option>
+      </select>
+      <button class="btn primary" id="an-search">查询</button>
+    </div>
     <nav class="subtabs" id="an-tabs">
       <button data-sub="iprank" class="active">流量排名-IP排名</button>
       <button data-sub="apprank">应用排名</button>

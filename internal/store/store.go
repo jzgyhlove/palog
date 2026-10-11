@@ -808,17 +808,57 @@ func (s *Store) topValues(col string, n int, where string, args []interface{}) (
 }
 
 // OfficialStats computes compact aggregates for the official-style pages.
-// devices limits scope the same way Stats does.
-func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, error) {
+// devices limits scope the same way Stats does. from/to are optional unix
+// seconds that further bound the window (0 = unset on that side); when either
+// is set, "last_hour" is reported as the whole-window total so it stays
+// consistent with the caller's chosen range.
+func (s *Store) OfficialStats(c Counters, devices []string, from, to int64) (*OfficialStats, error) {
 	out := &OfficialStats{}
 	out.Security.ParseErrors = c.ParseErrors
 
 	scope, sargs := scopeCond(devices)
+
+	// timeCond + timeArgs: the caller-provided ts window.
+	var timeCond string
+	var timeArgs []interface{}
+	if from > 0 {
+		timeCond += " AND ts >= ?"
+		timeArgs = append(timeArgs, from)
+	}
+	if to > 0 {
+		timeCond += " AND ts <= ?"
+		timeArgs = append(timeArgs, to)
+	}
+	hasWindow := from > 0 || to > 0
+
+	// baseWhere: device scope + optional ts window.
 	baseWhere := ""
 	baseArgs := []interface{}{}
 	if scope != "" {
 		baseWhere = " WHERE " + scope
-		baseArgs = sargs
+		baseArgs = append(baseArgs, sargs...)
+	}
+	if timeCond != "" {
+		if baseWhere == "" {
+			baseWhere = " WHERE 1=1" + timeCond
+		} else {
+			baseWhere += timeCond
+		}
+		baseArgs = append(baseArgs, timeArgs...)
+	}
+
+	// lastHourWhere: trailing-hour guard, only used when no window is given.
+	// When a window is given, LastHour is set to the window total instead.
+	lastHourWhere := baseWhere
+	lastHourArgs := append([]interface{}{}, baseArgs...)
+	if !hasWindow {
+		if lastHourWhere == "" {
+			lastHourWhere = " WHERE ts >= ?"
+			lastHourArgs = []interface{}{time.Now().Unix() - 3600}
+		} else {
+			lastHourWhere += " AND ts >= ?"
+			lastHourArgs = append(lastHourArgs, time.Now().Unix()-3600)
+		}
 	}
 
 	traffic := func() error {
@@ -834,18 +874,12 @@ func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, err
 		out.Traffic.BytesIn = bytesIn
 		out.Traffic.BytesOut = bytesOut
 
-		// last-hour count
-		lastWhere := baseWhere
-		lastArgs := append([]interface{}{}, baseArgs...)
-		if lastWhere == "" {
-			lastWhere = " WHERE ts >= ?"
-			lastArgs = []interface{}{time.Now().Unix() - 3600}
+		if hasWindow {
+			out.Traffic.LastHour = total
 		} else {
-			lastWhere += " AND ts >= ?"
-			lastArgs = append(lastArgs, time.Now().Unix()-3600)
-		}
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastWhere, lastArgs...).Scan(&out.Traffic.LastHour); err != nil {
-			return err
+			if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Traffic.LastHour); err != nil {
+				return err
+			}
 		}
 
 		// by kind
@@ -870,17 +904,12 @@ func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, err
 	}
 
 	// security last hour
-	secWhere := baseWhere
-	secArgs := append([]interface{}{}, baseArgs...)
-	if secWhere == "" {
-		secWhere = " WHERE ts >= ?"
-		secArgs = []interface{}{time.Now().Unix() - 3600}
+	if hasWindow {
+		out.Security.LastHour = out.Traffic.TotalRecords
 	} else {
-		secWhere += " AND ts >= ?"
-		secArgs = append(secArgs, time.Now().Unix()-3600)
-	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+secWhere, secArgs...).Scan(&out.Security.LastHour); err != nil {
-		return nil, err
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Security.LastHour); err != nil {
+			return nil, err
+		}
 	}
 
 	// IP ranking by total bytes (src_ip first, then dst_ip, then all non-empty)
@@ -888,7 +917,11 @@ func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, err
 	ipArgs := []interface{}{}
 	if scope != "" {
 		ipWhere += " AND " + scope
-		ipArgs = sargs
+		ipArgs = append(ipArgs, sargs...)
+	}
+	if timeCond != "" {
+		ipWhere += timeCond
+		ipArgs = append(ipArgs, timeArgs...)
 	}
 	rows, err := s.db.Query(
 		"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
@@ -916,7 +949,11 @@ func (s *Store) OfficialStats(c Counters, devices []string) (*OfficialStats, err
 	appArgs := []interface{}{}
 	if scope != "" {
 		appWhere += " AND " + scope
-		appArgs = sargs
+		appArgs = append(appArgs, sargs...)
+	}
+	if timeCond != "" {
+		appWhere += timeCond
+		appArgs = append(appArgs, timeArgs...)
 	}
 	appRows, err := s.db.Query(
 		"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
