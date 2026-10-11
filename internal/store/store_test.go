@@ -538,6 +538,78 @@ func TestMigrateLegacyDB(t *testing.T) {
 	}
 }
 
+func TestOfficialStats(t *testing.T) {
+	s := openTest(t)
+	if err := s.InsertBatch(devEntries()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+
+	// Default (no window): 系统概况 path — overview extras must be present
+	// and bounded to the trailing hour.
+	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Traffic.TotalRecords != 2 {
+		t.Fatalf("default total=%d, want 2", def.Traffic.TotalRecords)
+	}
+	if len(def.TopDomains) != 2 || def.TopDomains[0].Value != "a.example.com" {
+		t.Fatalf("top domains: %v", def.TopDomains)
+	}
+	if len(def.TopSrcIP) != 2 {
+		t.Fatalf("top src ip: %v", def.TopSrcIP)
+	}
+	if def.ByDevice["fw-1"] != 1 || def.ByDevice["fw-2"] != 1 {
+		t.Fatalf("by device: %v", def.ByDevice)
+	}
+	if len(def.Recent) != 2 {
+		t.Fatalf("recent: %d, want 2", len(def.Recent))
+	}
+	// Security.LastHour mirrors the traffic window total for the default call.
+	if def.Security.LastHour != 2 {
+		t.Fatalf("security last hour=%d, want 2", def.Security.LastHour)
+	}
+
+	// Explicit window: 流量分析 path — window aggregates present, overview
+	// extras skipped (they only belong to the default 概况 call).
+	custom, err := s.OfficialStats(Counters{}, nil, now-3600, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if custom.Traffic.TotalRecords != 2 {
+		t.Fatalf("window total=%d, want 2", custom.Traffic.TotalRecords)
+	}
+	if len(custom.TopDomains) != 0 || len(custom.TopSrcIP) != 0 ||
+		len(custom.ByDevice) != 0 || len(custom.Recent) != 0 {
+		t.Fatalf("window call must skip overview extras: %+v", custom)
+	}
+	if custom.Traffic.LastHour != custom.Traffic.TotalRecords {
+		t.Fatalf("window last_hour=%d total=%d, want equal",
+			custom.Traffic.LastHour, custom.Traffic.TotalRecords)
+	}
+
+	// Out-of-range window: counts fall back to 0, no full-table scan.
+	none, err := s.OfficialStats(Counters{}, nil, now-100000, now-99000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.Traffic.TotalRecords != 0 || none.Traffic.LastHour != 0 ||
+		none.Security.LastHour != 0 {
+		t.Fatalf("out-of-range window leaked counts: %+v", none)
+	}
+
+	// Device scope still applies to the default path.
+	scoped, err := s.OfficialStats(Counters{}, []string{"fw-1"}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped.Traffic.TotalRecords != 1 || scoped.ByDevice["fw-1"] != 1 {
+		t.Fatalf("scoped default: total=%d by_device=%v",
+			scoped.Traffic.TotalRecords, scoped.ByDevice)
+	}
+}
+
 func TestAppNameOf(t *testing.T) {
 	if got := AppNameOf(23); got != "SMTP" {
 		t.Errorf("AppNameOf(23) = %q, want SMTP", got)

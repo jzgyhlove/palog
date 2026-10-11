@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"palog/internal/receiver"
@@ -33,6 +35,14 @@ type Server struct {
 	RX      *receiver.Receiver
 	Started time.Time
 	DBPath  string
+
+	// Short-TTL memoization for the dashboard/系统概况 aggregates. The UI
+	// auto-refreshes every 10 s and re-runs expensive GROUP BYs on large
+	// tables; caching 30 s makes repeated refreshes cheap. Kept per-server
+	// (not package global) so each deployment has its own cache and tests
+	// using separate servers don't leak state.
+	cacheMu    sync.RWMutex
+	cache      map[string]statsCacheEntry
 }
 
 type ctxKey int
@@ -300,11 +310,16 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 		scope = []string{d}
 	}
+	if body, ok := s.cacheGet("stats", scope, statsCacheTTL); ok {
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
 	st, err := s.Store.Stats(s.counters(), time.Since(s.Started), scope)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.cacheSet("stats", scope, st)
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -330,12 +345,75 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The 30 s cache only applies to the default 1h-window call that the
+	// dashboard keeps re-issuing; custom windows are always computed fresh.
+	if from == 0 && to == 0 {
+		if body, ok := s.cacheGet("official", scope, statsCacheTTL); ok {
+			writeJSON(w, http.StatusOK, body)
+			return
+		}
+	}
 	off, err := s.Store.OfficialStats(s.counters(), scope, from, to)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if from == 0 && to == 0 {
+		s.cacheSet("official", scope, off)
+	}
 	writeJSON(w, http.StatusOK, off)
+}
+
+/* ---------------- short-TTL stats cache ---------------- */
+// The dashboard and 系统概况 auto-refresh every 10 s and run several
+// expensive GROUP BY aggregates. On large tables (10M+ rows) each run
+// takes 5-20 s. Memoizing the result for 30 s makes repeated refreshes
+// cheap without meaningfully hurting freshness.
+
+const statsCacheTTL = 30 * time.Second
+
+type statsCacheEntry struct {
+	at   time.Time
+	body interface{}
+}
+
+func (s *Server) cacheKeyFor(prefix string, scope []string) string {
+	// Canonicalize scope: sort and join so {a,b} == {b,a}.
+	keys := append([]string{}, scope...)
+	sort.Strings(keys)
+	return prefix + ":" + strings.Join(keys, ",")
+}
+
+func (s *Server) cacheGet(prefix string, scope []string, ttl time.Duration) (interface{}, bool) {
+	if s.cache == nil {
+		s.cache = map[string]statsCacheEntry{}
+	}
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	e, ok := s.cache[s.cacheKeyFor(prefix, scope)]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(e.at) > ttl {
+		return nil, false
+	}
+	return e.body, true
+}
+
+func (s *Server) cacheSet(prefix string, scope []string, body interface{}) {
+	if s.cache == nil {
+		s.cache = map[string]statsCacheEntry{}
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	// Prune expired entries to bound memory.
+	now := time.Now()
+	for k, e := range s.cache {
+		if now.Sub(e.at) > statsCacheTTL {
+			delete(s.cache, k)
+		}
+	}
+	s.cache[s.cacheKeyFor(prefix, scope)] = statsCacheEntry{at: now, body: body}
 }
 
 func contains(list []string, v string) bool {

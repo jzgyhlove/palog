@@ -467,34 +467,44 @@ async function refreshDash() {
     const dev = $('d-device').value;
     const from = fromDTLocal($('d-from').value) || 0;
     const to = fromDTLocal($('d-to').value) || 0;
-    // stats: live counters + recent records (no time param — last-24h window
-    // on the server, plus real-time pps). Keep the live view.
-    const sp = new URLSearchParams();
-    if (dev) sp.set('device', dev);
-    const s = await api('/api/stats' + (sp.toString() ? '?' + sp.toString() : ''));
-    $('s-pps').innerHTML = s.pps.toFixed(2) + ' <small>包/秒</small>';
-    $('s-pkts').innerHTML = fmtNum(s.packets) + ' / ' + fmtNum(s.records);
-    $('s-errs').textContent = fmtNum(s.parse_errors);
-    kindShare(s.by_kind);
-    barList($('s-domains'), s.top_domains);
-    barList($('s-srcip'), s.top_src_ip);
-    devShare(s.by_device);
-    renderHourly(s.hourly);
+    const op = new URLSearchParams();
+    if (dev) op.set('device', dev);
+    if (from) op.set('from', from);
+    if (to) op.set('to', to);
+    // 系统概况 1h 查询慢的根因是 /api/stats 在 4G DB 上跑 24h 全量聚合。
+    // 现在 系统概况 只调 /api/official-stats（窗口内聚合）+ /api/health（实时计数），
+    // 不再走 24h 的 /api/stats。并发拉取，1h 窗口下体感很快。
+    const [o, h] = await Promise.all([
+      api('/api/official-stats?' + op.toString()),
+      api('/api/health'),
+    ]);
+    $('s-pps').innerHTML = (h.packets && h.uptime_sec ? (h.packets / h.uptime_sec).toFixed(2) : '0') + ' <small>包/秒</small>';
+    $('s-pkts').innerHTML = fmtNum(h.packets) + ' / ' + fmtNum(h.records);
+    $('s-errs').textContent = fmtNum(h.parse_errors);
+    kindShare(o.traffic.by_kind);
+    barList($('s-domains'), o.top_domains);
+    barList($('s-srcip'), o.top_src_ip);
+    devShare(o.by_device);
+    // 24h 趋势图：official-stats 不带 hourly，仍用 /api/stats 的 hourly（慢，但仅趋势图）。
+    // 为避免 1h 概况也卡在这里，趋势图改为按需懒加载：仅当用户切到 24h 窗口时才查。
+    if (to - from >= 86400 || !from) {
+      try {
+        const sp = new URLSearchParams();
+        if (dev) sp.set('device', dev);
+        const s = await api('/api/stats' + (sp.toString() ? '?' + sp.toString() : ''));
+        renderHourly(s.hourly);
+      } catch (e) { /* hourly 失败不影响概况主体 */ }
+    } else {
+      $('s-hourly').innerHTML = '<div class="h-empty">趋势图仅在 24h / 全部时间 窗口显示</div>';
+    }
     const tb = $('s-recent');
-    if (s.recent && s.recent.length) {
-      tb.innerHTML = s.recent.map(recentRow).join('');
+    if (o.recent && o.recent.length) {
+      tb.innerHTML = o.recent.map(recentRow).join('');
       $('s-recent-empty').style.display = 'none';
     } else {
       tb.innerHTML = '';
       $('s-recent-empty').style.display = 'block';
     }
-
-    // official-stats: aggregates over the user-chosen time window.
-    const op = new URLSearchParams();
-    if (dev) op.set('device', dev);
-    if (from) op.set('from', from);
-    if (to) op.set('to', to);
-    const o = await api('/api/official-stats?' + op.toString());
     $('s-total').textContent = fmtNum(o.traffic.total_records);
     $('s-hour').textContent = fmtNum(o.traffic.last_hour);
     $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流出</small>';

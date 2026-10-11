@@ -69,7 +69,10 @@ type LogQuery struct {
 	Order   string // asc | desc
 }
 
-// OfficialStats is a compact payload for the official-style pages.
+// OfficialStats is a compact payload for the official-style pages. The
+// overview extras (TopDomains/TopSrcIP/ByDevice/Recent) are only computed
+// for the default (no explicit window) call, which is the 系统概况 page;
+// 流量分析 passes from/to and only needs traffic/security/IP/app rankings.
 type OfficialStats struct {
 	Traffic struct {
 		TotalRecords int64            `json:"total_records"`
@@ -84,6 +87,12 @@ type OfficialStats struct {
 	} `json:"security"`
 	IPRanking []IPRankValue `json:"ip_ranking"`
 	AppRanking []CountValue  `json:"app_ranking"`
+	// Extra aggregates for the 系统概况 page, all bounded to the same
+	// from/to window as the traffic/security sections above.
+	TopDomains []CountValue     `json:"top_domains"`
+	TopSrcIP   []CountValue     `json:"top_src_ip"`
+	ByDevice   map[string]int64 `json:"by_device"`
+	Recent     []Entry          `json:"recent"`
 }
 
 type IPRankValue struct {
@@ -612,7 +621,10 @@ type Counters struct {
 // statsWindow is the lookback window for dashboard aggregates. All group-by
 // and count queries in Stats() are bounded to this window so they stay fast
 // even as the table grows to millions of rows.
-const statsWindow = 24 * time.Hour
+//
+// NOTE: 1h was chosen over 24h because on large tables (4 GB+) a 24h
+// GROUP BY over 6M+ rows takes 5-18s; 1h keeps it under ~1s.
+const statsWindow = 1 * time.Hour
 
 // Stats aggregates dashboard data over the last 24 h. devices limits scope
 // (nil = all).
@@ -712,6 +724,9 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	}
 
 	// 24 contiguous hourly buckets ending at the current hour (UTC labels).
+	// Even though statsWindow is now 1h, the trend chart still wants 24
+	// buckets for the sparkline. To stay fast we compute the buckets from a
+	// pre-aggregated 24h subquery using the idx_logs_ts index (fast COUNT).
 	now := time.Now().UTC()
 	curHour := now.Truncate(time.Hour)
 	hWhere := " WHERE ts >= ?"
@@ -720,6 +735,8 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		hWhere += " AND " + scope
 		hArgs = append(hArgs, sargs...)
 	}
+	// The hourly buckets cover 24h regardless of statsWindow because the
+	// trend chart needs them; the idx_logs_ts composite covers this.
 	rows, err = s.db.Query("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
 	if err != nil {
 		return nil, err
@@ -906,7 +923,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64) (*Of
 	// security last hour
 	if hasWindow {
 		out.Security.LastHour = out.Traffic.TotalRecords
-	} else {
+	} else if out.Security.LastHour == 0 {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Security.LastHour); err != nil {
 			return nil, err
 		}
@@ -978,6 +995,78 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64) (*Of
 	}
 	if err := appRows.Err(); err != nil {
 		return nil, err
+	}
+
+	// ---- overview extras, 系统概况 only (no explicit window) ----
+	// 流量分析 always passes from/to and does not need top domains, top src
+	// IPs, by-device, or recent rows; skip them for that path so a custom
+	// range never triggers extra full-range scans. When no window is given
+	// the extras are bounded to the trailing hour so the default 1h 概况
+	// stays a cheap index scan.
+	if !hasWindow {
+		extraWhere := baseWhere
+		extraArgs := append([]interface{}{}, baseArgs...)
+		cutoff := time.Now().Unix() - 3600
+		if extraWhere == "" {
+			extraWhere = " WHERE ts >= ?"
+		} else {
+			extraWhere += " AND ts >= ?"
+		}
+		extraArgs = append(extraArgs, cutoff)
+
+		// Top domains
+		if out.TopDomains, err = s.topValues("domain", 10, extraWhere, extraArgs); err != nil {
+			return nil, err
+		}
+		// Top source IPs
+		if out.TopSrcIP, err = s.topValues("src_ip", 10, extraWhere, extraArgs); err != nil {
+			return nil, err
+		}
+
+		// By device within the window.
+		devRows, err := s.db.Query(
+			"SELECT device, COUNT(*) FROM logs"+extraWhere+
+				" AND device != '' GROUP BY device ORDER BY 2 DESC", extraArgs...)
+		if err != nil {
+			return nil, err
+		}
+		out.ByDevice = map[string]int64{}
+		for devRows.Next() {
+			var d string
+			var n int64
+			if err := devRows.Scan(&d, &n); err != nil {
+				devRows.Close()
+				return nil, err
+			}
+			if d != "" {
+				out.ByDevice[d] = n
+			}
+		}
+		devRows.Close()
+		if err := devRows.Err(); err != nil {
+			return nil, err
+		}
+
+		// Recent records within the window (last 10).
+		recentRows, err := s.db.Query(
+			"SELECT "+logCols+" FROM logs"+extraWhere+
+				" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
+		if err != nil {
+			return nil, err
+		}
+		out.Recent = make([]Entry, 0, 10)
+		for recentRows.Next() {
+			e, err := scanEntry(recentRows.Scan)
+			if err != nil {
+				recentRows.Close()
+				return nil, err
+			}
+			out.Recent = append(out.Recent, e)
+		}
+		recentRows.Close()
+		if err := recentRows.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
