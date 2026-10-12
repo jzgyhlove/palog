@@ -201,8 +201,10 @@ func TestOpenRecoversPoisonedWAL(t *testing.T) {
 	if err := seed.InsertBatch(sampleEntries()); err != nil {
 		t.Fatalf("seed rows: %v", err)
 	}
-	// Leave rows in the WAL so a fresh open has to read it back.
-	if _, err := seed.db.Exec("PRAGMA wal_checkpoint(NORMAL);"); err != nil {
+	// Leave rows in the WAL so a fresh open has to read it back: a RESTART
+	// checkpoint does not truncate the file, it only resets the recovery
+	// position — so the fresh Open must replay it and serve the rows.
+	if _, err := seed.db.Exec("PRAGMA wal_checkpoint(RESTART);"); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	seed.Close()

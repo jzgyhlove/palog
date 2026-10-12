@@ -350,8 +350,14 @@ func Open(path string) (*Store, error) {
 	// Reset a poisoned WAL before anything else runs. With no other
 	// connection present, wal_checkpoint(TRUNCATE) clears a -1
 	// checkpoint-mark and rewrites the -shm index; it is a no-op on a
-	// healthy WAL.
-	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+	// healthy WAL. RESTART (not TRUNCATE) is enough for the reset: it
+	// still clears the poisoned mark, but it does not rewrite the whole
+	// WAL — on a large un-checkpointed WAL (multi-GB, slow disk) a
+	// TRUNCATE checkpoint takes minutes and blocks the HTTP startup
+	// path behind it. An abandoned WAL on a healthy database is
+	// auto-recovered from maindb pages on first read; the next idle
+	// checkpoint (automatic or manual) drains it at leisure.
+	if _, err := db.Exec("PRAGMA wal_checkpoint(RESTART);"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("recover wal checkpoint: %w", err)
 	}
