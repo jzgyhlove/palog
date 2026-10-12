@@ -324,22 +324,16 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// modernc sqlite: one shared connection — SQLite is effectively
-	// single-connection (its locks are database-wide, so pool concurrency
-	// only adds lock contention). The connection serializes all activity
-	// in the driver's mutex, so a long read cannot starve a short writer:
-	// the ingest batch waits its turn instead of deadlocking behind a
-	// WAL checkpoint. The live deployment's WAL grew to 4.7 GB and the
-	// console returned SQLITE_BUSY for an hour with the default pool.
-	// The busy timeout covers the rare second writer that arrives while
-	// the single connection is mid-checkpoint.
-	//
-	// The WAL checkpoint still runs with readers present — and with
-	// busy_timeout=5000 it waits up to 5 s for the active transaction to
-	// drain before giving up with "database is locked" (a 10 s
-	// dashboard-agg GROUP BY is long enough to trip it). Raising the
-	// timeout to 60 s means the checkpoint simply waits for the reader
-	// to finish and then succeeds, instead of poisoning the writer.
+	// One shared connection (SQLite is effectively single-connection: its
+	// locks are database-wide, so pool concurrency only adds lock
+	// contention), fast immediate-rollback reads, and a 60 s busy
+	// timeout so overlapping writers wait for a reader instead of
+	// failing. The 5 s timeout that shipped earlier let warmup GROUP BYs
+	// time out mid-checkpoint, and an aborted checkpoint on a large WAL
+	// can poison the shared header (WAL size -1), after which EVERY
+	// connection deadlocks on a lock that will never be released —
+	// including a freshly started process. That was the live incident:
+	// a 5.1 GB WAL stuck the whole service, warmup or not.
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
@@ -353,6 +347,14 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// Reset a poisoned WAL before anything else runs. With no other
+	// connection present, wal_checkpoint(TRUNCATE) clears a -1
+	// checkpoint-mark and rewrites the -shm index; it is a no-op on a
+	// healthy WAL.
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover wal checkpoint: %w", err)
+	}
 	s := &Store{db: db, dbPath: path}
 	// legacy DBs (pre multi-device) lack logs.device; add it before schema
 	// so that idx_logs_device can be created.
@@ -1124,18 +1126,37 @@ func (s *Store) Warmup() error {
 	now := time.Now()
 	hour := now.Add(-time.Hour).Unix()
 	day := now.Add(-24 * time.Hour).Unix()
+
+	// All warmup work runs on a dedicated connection, kept out of the
+	// dashboard pool. The pool's single connection carries the ingest
+	// writer and dashboard readers; if the warmup's GROUP BYs ran on it,
+	// a checkpoint could commit under the long reader and grow the WAL
+	// unboundedly. A separate connection just warms its own page cache
+	// until it returns the pages to the OS on Close — harmless, and the
+	// first dashboard request after warmup re-reads the same hot pages
+	// from the OS cache instead of the SQLite cache.
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// q runs a single-row COUNT(*) probe on the dedicated warmup conn.
+	q := func(probe string, dest ...any) error {
+		return conn.QueryRowContext(context.Background(), probe).Scan(dest...)
+	}
+
 	var total, bytesIn, bytesOut int64
-	if err := s.db.QueryRow(
-		"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= ?",
-		hour).Scan(&total, &bytesIn, &bytesOut); err != nil {
+	if err := q(
+		"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= "+strconv.FormatInt(hour, 10),
+		&total, &bytesIn, &bytesOut); err != nil {
 		return err
 	}
 	_ = total
 	_ = bytesIn
 	_ = bytesOut
 	// 24h hourly buckets (Stats trend sparkline).
-	rows, err := s.db.Query(
-		"SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= ? GROUP BY h", day)
+	rows, err := conn.QueryContext(context.Background(),
+		"SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= "+strconv.FormatInt(day, 10)+" GROUP BY h")
 	if err != nil {
 		return err
 	}
@@ -1152,11 +1173,13 @@ func (s *Store) Warmup() error {
 	}
 	rows.Close()
 	// Top-N aggregates use the (ts, domain)/(ts, src_ip) composite indexes
-	// over the trailing hour; touch both so their pages are cached too.
+	// over the trailing hour; touch both so their tree pages are cached.
 	for _, col := range []string{"domain", "src_ip"} {
-		if err := s.db.QueryRow(
-			"SELECT COUNT(*) FROM (SELECT "+col+" FROM logs WHERE ts >= ? AND "+col+" != '' GROUP BY "+col+" ORDER BY COUNT(*) DESC LIMIT 10)",
-			hour).Scan(&total); err != nil {
+		var probe int64
+		if err := q(
+			"SELECT COUNT(*) FROM (SELECT "+col+" FROM logs WHERE ts >= "+strconv.FormatInt(hour, 10)+
+				" AND "+col+" != '' GROUP BY "+col+" ORDER BY COUNT(*) DESC LIMIT 10)",
+			&probe); err != nil {
 			return err
 		}
 	}
@@ -1170,7 +1193,8 @@ func (s *Store) Warmup() error {
 		"SELECT COUNT(*) FROM logs WHERE appid = 0",
 	}
 	for _, p := range probes {
-		if err := s.db.QueryRow(p).Scan(&total); err != nil {
+		var probe int64
+		if err := q(p, &probe); err != nil {
 			return err
 		}
 	}

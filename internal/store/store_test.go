@@ -184,6 +184,48 @@ func TestWarmup(t *testing.T) {
 	}
 }
 
+// TestOpenRecoversPoisonedWAL simulates the live-deployment incident: a
+// long-running checkpoint left the WAL in a state where a newly started
+// connection deadlocks on the write lock. Re-opening with the recovery
+// checkpoint must still succeed and be able to run the startup
+// aggregates.
+func TestOpenRecoversPoisonedWAL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Phase 1: create + populate a WAL db, leaving the WAL file on disk.
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("open seed: %v", err)
+	}
+	if err := seed.InsertBatch(sampleEntries()); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+	// Leave rows in the WAL so a fresh open has to read it back.
+	if _, err := seed.db.Exec("PRAGMA wal_checkpoint(NORMAL);"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	seed.Close()
+
+	// Phase 2: the store must open cleanly on the persisted WAL and still
+	// serve startup aggregates.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen on WAL db: %v", err)
+	}
+	defer s.Close()
+	if err := s.Warmup(); err != nil {
+		t.Fatalf("warmup after reopen: %v", err)
+	}
+	total, items, err := s.Query(LogQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("query after reopen: %v", err)
+	}
+	if total != 3 || len(items) != 3 {
+		t.Fatalf("rows lost after reopen: total=%d items=%d, want 3/3", total, len(items))
+	}
+}
+
 // ---- devices ----
 
 func TestDevices(t *testing.T) {
