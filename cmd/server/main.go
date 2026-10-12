@@ -77,14 +77,16 @@ func main() {
 		slog.Info("app dictionary loaded", "entries", n)
 	}
 
-	// Prime the SQLite page cache before serving so the first dashboard
-	// request after a restart does not pay the cold-cache cost of scanning
-	// large index/tree pages. Run synchronously: warmup takes well under a
-	// second on a large table and must finish before the HTTP server accepts
-	// requests, otherwise the first user request pays the cold cost itself.
-	if err := st.Warmup(); err != nil {
-		slog.Warn("store warmup", "err", err)
-	}
+	// Prime the SQLite page cache while the HTTP server already accepts
+	// requests. On large tables the warmup GROUP BYs take minutes of CPU,
+	// which must not block startup (a blocked main goroutine also stalls
+	// the graceful-shutdown drain of the UDP reader). Only log on error:
+	// a slow warmup is not a failure mode, requests just run uncached.
+	go func() {
+		if err := st.Warmup(); err != nil {
+			slog.Warn("store warmup", "err", err)
+		}
+	}()
 
 	rx := receiver.New(st, 4096)
 	go func() {
