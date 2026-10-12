@@ -5,6 +5,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"crypto/pbkdf2" // stdlib since Go 1.24
@@ -237,6 +239,17 @@ func AppNameOf(appid int) string {
 type Store struct {
 	db     *sql.DB
 	dbPath string
+
+	// mu serializes every logs-table write (INSERT / UPDATE / DELETE /
+	// VACUUM) against each other. database/sql pools connections, so the
+	// SQLite write lock otherwise races between separate batch
+	// transactions: any concurrent reader (a dashboard refresh) makes a
+	// checkpoint that grows the WAL until -1, after which every writer
+	// waits on the exclusive lock forever and SQLITE_BUSY kills the
+	// ingest. The live deployment's WAL grew to 4.7 GB this way, and the
+	// same failure shows up when a large GROUP BY overlaps a checkpoint.
+	// Readers stay parallel; only writers queue on this mutex.
+	wmu sync.Mutex
 }
 
 const schema = `
@@ -311,15 +324,26 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// modernc sqlite: single writer; WAL keeps readers unblocked.
-	// The busy timeout covers the writer-queue wait; reads are kept fast
-	// (immediate rollback) so that under concurrent load — the live
-	// deployment's background warmup GROUP BYs racing with 10 s dashboard
-	// refreshes — a reader never blocks on a long writer.
+	// modernc sqlite: one shared connection — SQLite is effectively
+	// single-connection (its locks are database-wide, so pool concurrency
+	// only adds lock contention). The connection serializes all activity
+	// in the driver's mutex, so a long read cannot starve a short writer:
+	// the ingest batch waits its turn instead of deadlocking behind a
+	// WAL checkpoint. The live deployment's WAL grew to 4.7 GB and the
+	// console returned SQLITE_BUSY for an hour with the default pool.
+	// The busy timeout covers the rare second writer that arrives while
+	// the single connection is mid-checkpoint.
+	//
+	// The WAL checkpoint still runs with readers present — and with
+	// busy_timeout=5000 it waits up to 5 s for the active transaction to
+	// drain before giving up with "database is locked" (a 10 s
+	// dashboard-agg GROUP BY is long enough to trip it). Raising the
+	// timeout to 60 s means the checkpoint simply waits for the reader
+	// to finish and then succeeds, instead of poisoning the writer.
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA busy_timeout=5000;",
+		"PRAGMA busy_timeout=60000;",
 		"PRAGMA read_uncommitted=1;",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
@@ -327,6 +351,8 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("pragma: %w", err)
 		}
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	s := &Store{db: db, dbPath: path}
 	// legacy DBs (pre multi-device) lack logs.device; add it before schema
 	// so that idx_logs_device can be created.
@@ -376,7 +402,10 @@ func (s *Store) migrateDeviceColumn() error {
 	if rows.Err() != nil {
 		return rows.Err()
 	}
-	_, err = s.db.Exec("ALTER TABLE logs ADD COLUMN device TEXT NOT NULL DEFAULT ''")
+	err = s.writeTx(func(tx *sql.Tx) error {
+		_, err := tx.Exec("ALTER TABLE logs ADD COLUMN device TEXT NOT NULL DEFAULT ''")
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("add logs.device: %w", err)
 	}
@@ -417,12 +446,17 @@ func (s *Store) migrateLegacy() error {
 		}
 	}
 	rows.Close()
-	if _, err := s.db.Exec(
-		"INSERT INTO devices(name, port, enabled) VALUES(?,?,1)", DefaultDevice, port); err != nil {
+	if err := s.writeTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			"INSERT INTO devices(name, port, enabled) VALUES(?,?,1)", DefaultDevice, port); err != nil {
+			return err
+		}
+		_, err := tx.Exec("UPDATE logs SET device=? WHERE device=''", DefaultDevice)
+		return err
+	}); err != nil {
 		return err
 	}
-	_, err = s.db.Exec("UPDATE logs SET device=? WHERE device=''", DefaultDevice)
-	return err
+	return nil
 }
 
 func parseUDPPort(addr string) (int, error) {
@@ -435,53 +469,68 @@ func parseUDPPort(addr string) (int, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// writeTx runs fn holding the write mutex, inside one transaction on a
+// dedicated connection.
+func (s *Store) writeTx(fn func(tx *sql.Tx) error) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // InsertBatch writes entries in one transaction.
 func (s *Store) InsertBatch(entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	stmt, err := tx.Prepare(`INSERT INTO logs
+	return s.writeTx(func(tx *sql.Tx) error {
+		stmt, err := tx.Prepare(`INSERT INTO logs
 	  (device, recv_ts, kind, ts, ts_end, src_ip, src_port, dst_ip, dst_port, proto,
 	   mac, iface, iface2, appid, domain, host, path, method, user,
 	   bytes_in, bytes_out, counters, flags, rec_type, extra, raw)
 	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	defer stmt.Close()
-	for _, e := range entries {
-		counters := ""
-		if len(e.Counters) > 0 {
-			b, err := json.Marshal(e.Counters)
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-			counters = string(b)
-		}
-		extra := ""
-		if len(e.Extra) > 0 {
-			b, err := json.Marshal(e.Extra)
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-			extra = string(b)
-		}
-		if _, err := stmt.Exec(e.Device, e.RecvTS, e.Kind, e.TS, e.TSEnd,
-			e.SrcIP, e.SrcPort, e.DstIP, e.DstPort, e.Proto,
-			e.MAC, e.Iface, e.Iface2, e.Appid, e.Domain, e.Host, e.Path, e.Method, e.User,
-			e.BytesIn, e.BytesOut, counters, e.Flags, e.RecType, extra, e.Raw); err != nil {
-			tx.Rollback()
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		defer stmt.Close()
+		for _, e := range entries {
+			counters := ""
+			if len(e.Counters) > 0 {
+				b, err := json.Marshal(e.Counters)
+				if err != nil {
+					return err
+				}
+				counters = string(b)
+			}
+			extra := ""
+			if len(e.Extra) > 0 {
+				b, err := json.Marshal(e.Extra)
+				if err != nil {
+					return err
+				}
+				extra = string(b)
+			}
+			if _, err := stmt.Exec(e.Device, e.RecvTS, e.Kind, e.TS, e.TSEnd,
+				e.SrcIP, e.SrcPort, e.DstIP, e.DstPort, e.Proto,
+				e.MAC, e.Iface, e.Iface2, e.Appid, e.Domain, e.Host, e.Path, e.Method, e.User,
+				e.BytesIn, e.BytesOut, counters, e.Flags, e.RecType, extra, e.Raw); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 const logCols = `id, device, recv_ts, kind, ts, ts_end, src_ip, src_port, dst_ip, dst_port,
@@ -1180,11 +1229,22 @@ func (s *Store) ApplyRetention(retentionDays int) (int64, error) {
 		return 0, nil
 	}
 	cutoff := time.Now().Unix() - int64(retentionDays)*86400
-	res, err := s.db.Exec("DELETE FROM logs WHERE ts < ?", cutoff)
-	if err != nil {
+	var n int64
+	if err := s.writeTx(func(tx *sql.Tx) error {
+		res, err := tx.Exec("DELETE FROM logs WHERE ts < ?", cutoff)
+		if err != nil {
+			return err
+		}
+		m, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		n = m
+		return nil
+	}); err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return n, nil
 }
 
 /* ---------------- devices ---------------- */
@@ -1242,31 +1302,25 @@ func (s *Store) UpsertDevice(d Device) (Device, error) {
 		en = 1
 	}
 	if d.ID > 0 {
-		tx, err := s.db.Begin()
-		if err != nil {
-			return d, err
-		}
-		var oldName string
-		if err := tx.QueryRow("SELECT name FROM devices WHERE id=?", d.ID).Scan(&oldName); err != nil {
-			tx.Rollback()
-			return d, err
-		}
-		res, err := tx.Exec("UPDATE devices SET name=?, port=?, enabled=? WHERE id=?", d.Name, d.Port, en, d.ID)
-		if err != nil {
-			tx.Rollback()
-			return d, err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			tx.Rollback()
-			return d, fmt.Errorf("device %d not found", d.ID)
-		}
-		if oldName != d.Name {
-			if _, err := tx.Exec("UPDATE logs SET device=? WHERE device=?", d.Name, oldName); err != nil {
-				tx.Rollback()
-				return d, err
+		err := s.writeTx(func(tx *sql.Tx) error {
+			var oldName string
+			if err := tx.QueryRow("SELECT name FROM devices WHERE id=?", d.ID).Scan(&oldName); err != nil {
+				return err
 			}
-		}
-		if err := tx.Commit(); err != nil {
+			res, err := tx.Exec("UPDATE devices SET name=?, port=?, enabled=? WHERE id=?", d.Name, d.Port, en, d.ID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("device %d not found", d.ID)
+			}
+			if oldName != d.Name {
+				_, err := tx.Exec("UPDATE logs SET device=? WHERE device=?", d.Name, oldName)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
 			return d, err
 		}
 	} else {
@@ -1279,7 +1333,6 @@ func (s *Store) UpsertDevice(d Device) (Device, error) {
 	}
 	return d, nil
 }
-
 // DeleteDevice removes a device and returns the name that was deleted.
 func (s *Store) DeleteDevice(id int64) (string, error) {
 	var name string
