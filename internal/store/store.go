@@ -312,10 +312,15 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	// modernc sqlite: single writer; WAL keeps readers unblocked.
+	// The busy timeout covers the writer-queue wait; reads are kept fast
+	// (immediate rollback) so that under concurrent load — the live
+	// deployment's background warmup GROUP BYs racing with 10 s dashboard
+	// refreshes — a reader never blocks on a long writer.
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA busy_timeout=5000;",
+		"PRAGMA read_uncommitted=1;",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			db.Close()
