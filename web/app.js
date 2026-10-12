@@ -471,36 +471,25 @@ async function refreshDash() {
     if (dev) op.set('device', dev);
     if (from) op.set('from', from);
     if (to) op.set('to', to);
-    // 系统概况 1h 查询慢的根因是 默认调用在大表上跑全量 GROUP BY。
-    // 现在 系统概况 默认只拉 cheap 聚合(流量汇总/by_kind/security)，
-    // 不跑排名与 top 列表；按需 ?full=1 才拉排名/域/IP/设备分布/最近记录。
-    // 默认 1h 走 cheap 路径(不跑排名/top/group-by)；用户勾选「详细统计」
-    // 或切到 24h/全部时间窗口时才传 full=1 让后端按需计算重聚合。
+    // 系统概况 默认 1h 走 cheap 路径：流量汇总 / by_kind / by_device /
+    // top_domains / top_src_ip 全部为尾小时窗口内的索引限定查询，可直接
+    // 渲染各面板；「详细统计」(?full=1) 额外拉最近记录，24h/全部时间
+    // 窗口自动附带 full=1。
     const full = (($('d-full') && $('d-full').checked) || (from && to - from >= 86400));
-    const [o, h] = await Promise.all([
+    const [o, h, s] = await Promise.all([
       api('/api/official-stats?' + op.toString() + (full ? '&full=1' : '')),
       api('/api/health'),
+      // 24h 趋势图：/api/stats 仅计算 24 个小时桶 + 尾小时计数，成本可控。
+      api('/api/stats' + (dev ? '?device=' + encodeURIComponent(dev) : '')),
     ]);
     $('s-pps').innerHTML = (h.packets && h.uptime_sec ? (h.packets / h.uptime_sec).toFixed(2) : '0') + ' <small>包/秒</small>';
     $('s-pkts').innerHTML = fmtNum(h.packets) + ' / ' + fmtNum(h.records);
     $('s-errs').textContent = fmtNum(h.parse_errors);
-    kindShare(o.traffic.by_kind);
-    // cheap 默认路径不带 top_domains/top_src_ip/recent — barList/表渲染需容错。
+    kindShare(o.traffic.by_kind || {});
     barList($('s-domains'), o.top_domains);
     barList($('s-srcip'), o.top_src_ip);
     devShare(o.by_device);
-    // 24h 趋势图：official-stats 不带 hourly，仍用 /api/stats 的 hourly。
-    // 默认 1h cheap 路径下不查(避免重聚合)，仅当用户切到 24h/全部时间窗口时查。
-    if (from && to - from >= 86400) {
-      try {
-        const sp = new URLSearchParams();
-        if (dev) sp.set('device', dev);
-        const s = await api('/api/stats' + (sp.toString() ? '?' + sp.toString() : ''));
-        renderHourly(s.hourly);
-      } catch (e) { /* hourly 失败不影响概况主体 */ }
-    } else {
-      $('s-hourly').innerHTML = '<div class="h-empty">趋势图仅在 24h / 全部时间 窗口显示</div>';
-    }
+    renderHourly(s.hourly);
     const tb = $('s-recent');
     if (o.recent && o.recent.length) {
       tb.innerHTML = o.recent.map(recentRow).join('');

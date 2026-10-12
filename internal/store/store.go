@@ -740,16 +740,18 @@ func (s *Store) topValues(col string, n int, where string, args []interface{}) (
 // stays consistent with the caller's chosen range.
 //
 // cheap / rank / full select which aggregates are computed:
-//   - cheap=true (bare 系统概况 auto-refresh): only the index-bounded set —
-//     trailing-hour COUNT via idx_logs_ts, by_kind via the handful-of-kinds
-//     partial scan, and the security section. No full-table scan, no
-//     rankings, no group-bys: this is what keeps the default 1h view fast
-//     on a large table.
+//   - cheap=true (bare 系统概况 auto-refresh): the index-bounded set —
+//     trailing-hour COUNT+SUM via idx_logs_ts, by_kind / by_device via the
+//     handful-of-kinds / handful-of-devices partial scans, top domains /
+//     top src IP via the (ts, domain)/(ts, src_ip) composite indexes, and
+//     the security section. No full-table scan, no rankings: this is what
+//     keeps the default 1h view fast on a large table.
 //   - rank=true (流量分析): the cheap set plus the LIMIT-20 IP/app
 //     rankings (by_bytes / by_count scans bounded by the window).
-//   - full=true (opt-in deep-dive, ?full=1): adds the heavy overview
-//     extras (top domains/src_ip, by device, recent rows) bounded to the
-//     window, or to the trailing hour when no window is given.
+//   - full=true (opt-in deep-dive, ?full=1): adds the recent-rows list
+//     bounded to the window, or to the trailing hour when no window is
+//     given. (Top domains / src IP, by_kind and by_device are already in
+//     the cheap set and therefore always present.)
 func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full, rank, cheap bool) (*OfficialStats, error) {
 	out := &OfficialStats{}
 	out.Security.ParseErrors = c.ParseErrors
@@ -856,27 +858,51 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			}
 		}
 
-		// by_kind is a GROUP BY over the whole window — only worth paying for
-		// when the caller explicitly asked for rankings or full deep-dive.
-		// The cheap 系统概况 auto-refresh skips it to stay index-only.
-		if rank || full {
-			out.Traffic.ByKind = map[string]int64{}
-			rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
-			if err != nil {
+		// by_kind / by_device: tiny GROUP BYs — the kind column holds a
+		// handful of values and a deployment registers only a handful of
+		// devices, so both stay cheap even when the window is large.
+		// Computed on every path (including cheap) so the 系统概况 1h
+		// view shows 日志类型分布 and 设备分布 without the heavy extras.
+		out.Traffic.ByKind = map[string]int64{}
+		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k string
+			var n int64
+			if err := rows.Scan(&k, &n); err != nil {
 				return err
 			}
-			defer rows.Close()
-			for rows.Next() {
-				var k string
-				var n int64
-				if err := rows.Scan(&k, &n); err != nil {
-					return err
-				}
-				out.Traffic.ByKind[k] = n
-			}
-			return rows.Err()
+			out.Traffic.ByKind[k] = n
 		}
-		return nil
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		devWhere := trafficBase
+		devArgs := append([]interface{}{}, trafficArgs...)
+		devWhere += " AND device != ''"
+		devRows, err := s.db.Query(
+			"SELECT device, COUNT(*) FROM logs"+devWhere+
+				" GROUP BY device ORDER BY 2 DESC LIMIT 100", devArgs...)
+		if err != nil {
+			return err
+		}
+		out.ByDevice = map[string]int64{}
+		for devRows.Next() {
+			var d string
+			var n int64
+			if err := devRows.Scan(&d, &n); err != nil {
+				devRows.Close()
+				return err
+			}
+			if d != "" {
+				out.ByDevice[d] = n
+			}
+		}
+		devRows.Close()
+		return devRows.Err()
 	}
 	if err := traffic(); err != nil {
 		return nil, err
@@ -980,33 +1006,21 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		}
 	}
 
-	// ---- overview extras, opt-in via ?full=1 (系统概况 deep-dive) ----
-	// These are the expensive group-bys the 系统概况 1h auto-refresh must
-	// avoid by default: top domain/src_ip lists, by-device distribution
-	// and recent rows. When a window is given they follow that window;
-	// without one they are bounded to the trailing hour so even a deep
-	// dive of the default 概况 stays an index-bounded set of queries.
-	if full {
+	// ---- overview extras ----
+	// Top domain / source-IP lists are always computed so the 系统概况 1h
+	// view can show them; they follow the effective window, which the
+	// cheap path bounds to the trailing hour, so even the default call
+	// stays an index-bounded set of queries (the (ts, domain) /
+	// (ts, src_ip) composite indexes serve both). The recent-rows list
+	// is still opt-in via ?full=1 (it materializes full rows, which the
+	// auto-refresh does not need).
+	{
 		extraWhere := baseWhere
 		extraArgs := append([]interface{}{}, baseArgs...)
-		if !hasWindow && !cheap {
-			// 概况 deep-dive with no explicit window: bound the extras to
-			// the trailing hour so the call stays a cheap index scan.
-			cutoff := time.Now().Unix() - 3600
-			if extraWhere == "" {
-				extraWhere = " WHERE ts >= ?"
-			} else {
-				extraWhere += " AND ts >= ?"
-			}
-			extraArgs = append(extraArgs, cutoff)
+		if extraWhere == "" {
+			extraWhere = " WHERE ts >= ?"
+			extraArgs = append(extraArgs, time.Now().Unix()-3600)
 		}
-	// By-device on the bare call (no window) must stay bounded to the
-	// trailing hour like the other extras; on a windowed call the
-	// window already bounds it.
-	if extraWhere == "" {
-		extraWhere = " WHERE ts >= ?"
-		extraArgs = append(extraArgs, time.Now().Unix()-3600)
-	}
 
 		// Top domains
 		var err error
@@ -1018,52 +1032,27 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			return nil, err
 		}
 
-		// By device within the window.
-		devWhere := extraWhere
-		devArgs := append([]interface{}{}, extraArgs...)
-		devWhere += " AND device != ''"
-		devRows, err := s.db.Query(
-			"SELECT device, COUNT(*) FROM logs"+devWhere+
-				" GROUP BY device ORDER BY 2 DESC", devArgs...)
-		if err != nil {
-			return nil, err
-		}
-		out.ByDevice = map[string]int64{}
-		for devRows.Next() {
-			var d string
-			var n int64
-			if err := devRows.Scan(&d, &n); err != nil {
-				devRows.Close()
-				return nil, err
-			}
-			if d != "" {
-				out.ByDevice[d] = n
-			}
-		}
-		devRows.Close()
-		if err := devRows.Err(); err != nil {
-			return nil, err
-		}
-
-		// Recent records within the window (last 10).
-		recentRows, err := s.db.Query(
-			"SELECT "+logCols+" FROM logs"+extraWhere+
-				" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
-		if err != nil {
-			return nil, err
-		}
-		out.Recent = make([]Entry, 0, 10)
-		for recentRows.Next() {
-			e, err := scanEntry(recentRows.Scan)
+		// Recent records within the window (last 10) — deep-dive only.
+		if full {
+			recentRows, err := s.db.Query(
+				"SELECT "+logCols+" FROM logs"+extraWhere+
+					" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
 			if err != nil {
-				recentRows.Close()
 				return nil, err
 			}
-			out.Recent = append(out.Recent, e)
-		}
-		recentRows.Close()
-		if err := recentRows.Err(); err != nil {
-			return nil, err
+			out.Recent = make([]Entry, 0, 10)
+			for recentRows.Next() {
+				e, err := scanEntry(recentRows.Scan)
+				if err != nil {
+					recentRows.Close()
+					return nil, err
+				}
+				out.Recent = append(out.Recent, e)
+			}
+			recentRows.Close()
+			if err := recentRows.Err(); err != nil {
+				return nil, err
+			}
 		}
 	}
 

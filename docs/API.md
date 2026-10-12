@@ -114,9 +114,9 @@ Body:`{"username":"admin","password":"..."}`。
 系统概况/流量分析聚合(按用户设备范围过滤)。
 Query 参数:`device`(可选,越权 → 403)、`from`/`to`(Unix 秒或 RFC3339,缺省 = 不设时间边界,`LastHour` 镜像尾小时)、`rank`(可选,`1`/`true` 计算 IP/应用排名)、`full`(可选,`1`/`true` 计算重聚合,隐含 rank)。
 
-- **默认(无 `rank`/`full`)**:轻量路径,供 系统概况 1h 自动刷新 — 全部聚合(流量汇总、`by_kind`、security)只走 `idx_logs_ts` 的尾小时窗口,大表上保持秒级;`ip_ranking`/`app_ranking` 为空数组,`top_domains`/`top_src_ip`/`by_device`/`recent` 缺省。
-- **`?rank=1`**:流量分析路径 — 追加计算当前窗口内的 IP 排名 Top20 与应用排名 Top20(走 `idx_logs_ts_appid` 等索引),不算 概况 extras。
-- **`?full=1`**:概况深挖 — 在 rank 基础上追加 Top 域名/源 IP、设备分布、最近 10 条;无窗口时 extras 限定尾小时。
+- **默认(无 `rank`/`full`)**:轻量路径,供 系统概况 1h 自动刷新 — 流量汇总、`by_kind`、`by_device`、`top_domains`/`top_src_ip`(尾 10)全部限定尾小时窗口,走 `idx_logs_ts` 及 `(ts, domain)`/`(ts, src_ip)` 复合索引,大表上保持秒级;`ip_ranking`/`app_ranking`/`recent` 为空。
+- **`?rank=1`**:流量分析路径 — 追加计算当前窗口内的 IP 排名 Top20 与应用排名 Top20(走 `idx_logs_ts_appid` 等索引),不算最近记录。
+- **`?full=1`**:概况深挖 — 在 rank 基础上追加最近 10 条;无窗口时限定尾小时。
 
 响应:
 ```json

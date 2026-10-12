@@ -544,9 +544,11 @@ func TestOfficialStats(t *testing.T) {
 	}
 	now := time.Now().Unix()
 
-	// Default cheap (系统概况 auto-refresh): only index-bounded aggregates —
-	// no rankings, no extras, so a large 1h row set stays fast. All
-	// aggregates are bounded to the trailing hour.
+	// Default cheap (系统概况 auto-refresh): index-bounded aggregates —
+	// trailing-hour COUNT+SUM, by_kind / by_device (tiny GROUP BYs the UI
+	// panels need by default) and top-domain / top-src_ip probes via the
+	// (ts, domain)/(ts, src_ip) composite indexes; no rankings, no
+	// recent-rows materialization, so a large 1h row set stays fast.
 	def, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, false, false, true)
 	if err != nil {
 		t.Fatal(err)
@@ -558,14 +560,24 @@ func TestOfficialStats(t *testing.T) {
 		t.Fatalf("cheap path must skip rankings: ip=%d app=%d",
 			len(def.IPRanking), len(def.AppRanking))
 	}
-	if len(def.TopDomains) != 0 || len(def.TopSrcIP) != 0 ||
-		len(def.ByDevice) != 0 || len(def.Recent) != 0 {
-		t.Fatalf("cheap path must skip overview extras: %+v", def)
+	if len(def.Recent) != 0 {
+		t.Fatalf("cheap path must skip recent rows: %+v", def.Recent)
 	}
-	// by_kind is a GROUP BY — only computed for rank/full, never on the
-	// cheap auto-refresh path.
-	if len(def.Traffic.ByKind) != 0 {
-		t.Fatalf("cheap path must skip by_kind: %+v", def.Traffic.ByKind)
+	// by_kind is computed on the cheap path (small cardinality GROUP BY):
+	// both devEntries rows share kind "dnsquery" → one entry, count 2.
+	if len(def.Traffic.ByKind) != 1 || def.Traffic.ByKind["dnsquery"] != 2 {
+		t.Fatalf("cheap path must compute by_kind: %+v", def.Traffic.ByKind)
+	}
+	// by_device: both devices present with one record each.
+	if def.ByDevice["fw-1"] != 1 || def.ByDevice["fw-2"] != 1 {
+		t.Fatalf("cheap path must compute by_device: %v", def.ByDevice)
+	}
+	// Top domains / top src IPs follow the trailing-hour bound.
+	if len(def.TopDomains) != 2 || def.TopDomains[0].Count != 1 {
+		t.Fatalf("cheap path must compute top domains: %v", def.TopDomains)
+	}
+	if len(def.TopSrcIP) != 2 {
+		t.Fatalf("cheap path must compute top src ip: %v", def.TopSrcIP)
 	}
 	// Security.LastHour mirrors the traffic trailing-hour total.
 	if def.Security.LastHour != 2 {
@@ -573,8 +585,8 @@ func TestOfficialStats(t *testing.T) {
 	}
 
 	// Explicit window, no rank: traffic totals bounded to the window,
-	// rankings and extras skipped (this is the cost of 流量分析 without
-	// ?rank=1 — now opt-in).
+	// rankings and recent rows skipped (opt-in); by_kind / by_device /
+	// top domains / top src ip follow the window.
 	winNoRank, err := s.OfficialStats(Counters{}, nil, now-3600, now, false, false, false)
 	if err != nil {
 		t.Fatal(err)
@@ -584,6 +596,15 @@ func TestOfficialStats(t *testing.T) {
 	}
 	if len(winNoRank.IPRanking) != 0 || len(winNoRank.AppRanking) != 0 {
 		t.Fatalf("window call without rank must skip rankings: %+v", winNoRank)
+	}
+	if len(winNoRank.Recent) != 0 {
+		t.Fatalf("window call without full must skip recent rows: %+v", winNoRank)
+	}
+	if len(winNoRank.TopDomains) != 2 {
+		t.Fatalf("window call must compute top domains: %v", winNoRank.TopDomains)
+	}
+	if winNoRank.ByDevice["fw-1"] != 1 || winNoRank.ByDevice["fw-2"] != 1 {
+		t.Fatalf("window call must compute by_device: %v", winNoRank.ByDevice)
 	}
 	if winNoRank.Traffic.LastHour != winNoRank.Traffic.TotalRecords {
 		t.Fatalf("window last_hour=%d total=%d, want equal",
@@ -605,11 +626,10 @@ func TestOfficialStats(t *testing.T) {
 	if len(custom.AppRanking) != 0 {
 		t.Fatalf("window call with no appid rows: app ranking should be empty, got %+v", custom)
 	}
-	if len(custom.TopDomains) != 0 || len(custom.TopSrcIP) != 0 ||
-		len(custom.ByDevice) != 0 || len(custom.Recent) != 0 {
-		t.Fatalf("window call without full must skip extras: %+v", custom)
+	if len(custom.Recent) != 0 {
+		t.Fatalf("window call without full must skip recent rows: %+v", custom)
 	}
-	// rank path computes by_kind (GROUP BY only paid for on rank/full).
+	// rank path computes by_kind (GROUP BY over the window).
 	// Both devEntries rows share kind "dnsquery" → one map entry, count 2.
 	if len(custom.Traffic.ByKind) != 1 || custom.Traffic.ByKind["dnsquery"] != 2 {
 		t.Fatalf("rank path must compute by_kind: %+v", custom.Traffic.ByKind)
@@ -619,8 +639,8 @@ func TestOfficialStats(t *testing.T) {
 			custom.Traffic.LastHour, custom.Traffic.TotalRecords)
 	}
 
-	// full=true default: 系统概况 deep-dive — rankings + extras present
-	// and bounded to the trailing hour.
+	// full=true default: 系统概况 deep-dive — rankings + recent rows
+	// present, all bounded to the trailing hour.
 	fullDef, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, 0, 0, true, true, false)
 	if err != nil {
 		t.Fatal(err)
@@ -636,12 +656,6 @@ func TestOfficialStats(t *testing.T) {
 	}
 	if len(fullDef.Recent) != 2 {
 		t.Fatalf("recent: %d, want 2", len(fullDef.Recent))
-	}
-	if len(fullDef.IPRanking) == 0 {
-		t.Fatalf("full default must compute ip ranking")
-	}
-	if len(fullDef.Traffic.ByKind) == 0 {
-		t.Fatalf("full default must compute by_kind")
 	}
 
 	// Out-of-range window: counts fall back to 0, no full-table scan.
