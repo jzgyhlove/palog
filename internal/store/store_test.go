@@ -738,3 +738,161 @@ func TestAppNameOf(t *testing.T) {
 		t.Errorf("AppNameOf(-1) = %q, want empty", got)
 	}
 }
+
+// ---- two-factor (TOTP) user state ----
+
+func TestUserTFA(t *testing.T) {
+	s := openTest(t)
+	u, err := s.CreateUser(User{Username: "tfa1", Role: RoleUser, Devices: "*", TFARequired: true}, "pw123456")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if !u.TFARequired || u.TFAEnabled || u.TFASecret != "" {
+		t.Fatalf("created user TFA state: %+v", u)
+	}
+
+	// forced-required but not yet enrolled
+	got, err := s.GetUser(u.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.TFARequired || got.TFAEnabled {
+		t.Fatalf("pre-enroll user req=%v en=%v", got.TFARequired, got.TFAEnabled)
+	}
+
+	// enroll a secret -> TFAEnabled flips true
+	if err := s.SetUserTFASecret(u.ID, "ABCDEFGHIJKLMNOP"); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
+	got, _ = s.GetUser(u.ID)
+	if !got.TFAEnabled {
+		t.Fatalf("TFAEnabled false after enrolling secret")
+	}
+
+	// ListUsers reports the flags and must not leak the secret
+	list, err := s.ListUsers()
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v %d", err, len(list))
+	}
+	if !list[0].TFARequired || !list[0].TFAEnabled {
+		t.Fatalf("ListUsers TFA flags: %+v", list[0])
+	}
+	if list[0].TFASecret != "" {
+		t.Fatalf("ListUsers leaked secret: %q", list[0].TFASecret)
+	}
+
+	// GetUserByUsername carries the secret (login verification needs it)
+	full, err := s.GetUserByUsername("tfa1")
+	if err != nil || full == nil || full.TFASecret != "ABCDEFGHIJKLMNOP" || !full.TFAEnabled {
+		t.Fatalf("by username secret: %+v err=%v", full, err)
+	}
+
+	// the force flag toggles independently of enrollment
+	if err := s.SetUserTFARequired(u.ID, false); err != nil {
+		t.Fatalf("clear required: %v", err)
+	}
+	got, _ = s.GetUser(u.ID)
+	if got.TFARequired || !got.TFAEnabled {
+		t.Fatalf("after clearing required: req=%v en=%v", got.TFARequired, got.TFAEnabled)
+	}
+
+	// clearing the secret disables enrollment
+	if err := s.SetUserTFASecret(u.ID, ""); err != nil {
+		t.Fatalf("clear secret: %v", err)
+	}
+	got, _ = s.GetUser(u.ID)
+	if got.TFAEnabled {
+		t.Fatalf("TFAEnabled true after clearing secret")
+	}
+}
+
+// ---- TLS / captcha config ----
+
+func TestConfigTLSAndCaptcha(t *testing.T) {
+	s := openTest(t)
+	cfg, err := s.GetConfig("/tmp/x.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS || cfg.Captcha || cfg.TLSCert != "" || cfg.TLSKey != "" {
+		t.Fatalf("TLS/captcha defaults must be off: %+v", cfg)
+	}
+	in := Config{
+		HTTPAddr: ":8443", RetentionDays: 14,
+		TLS: true, TLSCert: "CERTPEM", TLSKey: "KEYPEM", Captcha: true,
+	}
+	if err := s.SetConfig(in); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = s.GetConfig("/tmp/x.db")
+	if !cfg.TLS || !cfg.Captcha || cfg.TLSCert != "CERTPEM" || cfg.TLSKey != "KEYPEM" ||
+		cfg.HTTPAddr != ":8443" || cfg.RetentionDays != 14 {
+		t.Fatalf("TLS/captcha round-trip failed: %+v", cfg)
+	}
+	// SetConfig is a full write: an empty cert clears it (the admin form
+	// submits the whole config on every save).
+	if err := s.SetConfig(Config{HTTPAddr: ":8443", RetentionDays: 14}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = s.GetConfig("/tmp/x.db")
+	if cfg.TLS || cfg.Captcha || cfg.TLSCert != "" || cfg.TLSKey != "" {
+		t.Fatalf("cleared config not persisted: %+v", cfg)
+	}
+}
+
+// ---- migration: pre-TFA users table ----
+
+func TestMigrateUserTFA(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-users.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	legacySchema := `CREATE TABLE users (
+	  id INTEGER PRIMARY KEY AUTOINCREMENT,
+	  username TEXT NOT NULL UNIQUE,
+	  pass_hash TEXT NOT NULL,
+	  role TEXT NOT NULL DEFAULT 'user',
+	  devices TEXT NOT NULL DEFAULT '*',
+	  created_at INTEGER NOT NULL
+	);
+	CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);`
+	if _, err := legacy.Exec(legacySchema); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	hash, err := HashPassword("legacypw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(
+		`INSERT INTO users(username, pass_hash, role, devices, created_at) VALUES(?,?,?,?,?)`,
+		"olduser", hash, RoleAdmin, "*", time.Now().Unix()); err != nil {
+		t.Fatalf("legacy user insert: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated: %v", err)
+	}
+	defer s.Close()
+
+	// the legacy row survives with the new columns defaulted off
+	u, err := s.GetUserByUsername("olduser")
+	if err != nil || u == nil {
+		t.Fatalf("legacy user lost: %v", err)
+	}
+	if u.TFARequired || u.TFAEnabled || u.TFASecret != "" {
+		t.Fatalf("migrated user TFA state: %+v", u)
+	}
+	// the new columns are writable after migration
+	if err := s.SetUserTFASecret(u.ID, "SEKRET"); err != nil {
+		t.Fatalf("set secret after migrate: %v", err)
+	}
+	u, _ = s.GetUserByUsername("olduser")
+	if !u.TFAEnabled || u.TFASecret != "SEKRET" {
+		t.Fatalf("secret not stored after migrate: %+v", u)
+	}
+}

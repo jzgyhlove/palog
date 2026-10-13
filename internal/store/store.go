@@ -137,6 +137,16 @@ type Config struct {
 	HTTPAddr      string `json:"http_addr"`
 	RetentionDays int    `json:"retention_days"`
 	DBPath        string `json:"db_path"`
+
+	// TLS, TLSCert and TLSKey configure the console over HTTPS. When TLS is
+	// true the server terminates TLS in-process using the stored PEM
+	// certificate chain and private key; a change requires a restart.
+	TLS     bool   `json:"tls"`
+	TLSCert string `json:"tls_cert"`
+	TLSKey  string `json:"tls_key"`
+
+	// Captcha requires an arithmetic challenge on every login.
+	Captcha bool `json:"captcha"`
 }
 
 // Device is one log source: a named UDP port.
@@ -156,6 +166,13 @@ type User struct {
 	Role      string `json:"role"` // admin | user
 	Devices   string `json:"devices"`
 	CreatedAt int64  `json:"created_at"`
+
+	// TFARequired is the admin-forced "must use two-factor" flag; TFAEnabled
+	// reports whether the user has actually enrolled a TOTP secret. TFASecret
+	// is the base32 TOTP secret and is never serialized.
+	TFARequired bool   `json:"tfa_required"`
+	TFAEnabled  bool   `json:"tfa_enabled"`
+	TFASecret   string `json:"-"`
 }
 
 // Default device name used to stamp rows collected before the device table
@@ -309,7 +326,9 @@ CREATE TABLE IF NOT EXISTS users (
   pass_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
   devices TEXT NOT NULL DEFAULT '*',
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  tfa_required INTEGER NOT NULL DEFAULT 0,
+  tfa_secret TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
@@ -376,7 +395,56 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate legacy: %w", err)
 	}
+	if err := s.migrateUserTFA(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate user tfa: %w", err)
+	}
 	return s, nil
+}
+
+// migrateUserTFA adds the two-factor columns to pre-TFA databases. Fresh
+// databases already get them from schema; an existing users table needs
+// ALTER TABLE, which SQLite supports one column at a time.
+func (s *Store) migrateUserTFA() error {
+	var tbl int
+	if err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'").Scan(&tbl); err != nil {
+		return err
+	}
+	if tbl == 0 {
+		return nil // fresh database: schema creates the columns
+	}
+	have := map[string]bool{}
+	rows, err := s.db.Query("PRAGMA table_info(users)")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range []struct{ col, ddl string }{
+		{"tfa_required", "ALTER TABLE users ADD COLUMN tfa_required INTEGER NOT NULL DEFAULT 0"},
+		{"tfa_secret", "ALTER TABLE users ADD COLUMN tfa_secret TEXT NOT NULL DEFAULT ''"},
+	} {
+		if have[c.col] {
+			continue
+		}
+		if _, err := s.db.Exec(c.ddl); err != nil {
+			return fmt.Errorf("add users.%s: %w", c.col, err)
+		}
+	}
+	return nil
 }
 
 // migrateDeviceColumn adds logs.device to pre-device databases. It must run
@@ -1229,19 +1297,32 @@ func (s *Store) GetConfig(dbPath string) (Config, error) {
 			cfg.HTTPAddr = v
 		case "retention_days":
 			fmt.Sscanf(v, "%d", &cfg.RetentionDays)
+		case "tls":
+			cfg.TLS = v == "1" || v == "true"
+		case "tls_cert":
+			cfg.TLSCert = v
+		case "tls_key":
+			cfg.TLSKey = v
+		case "captcha":
+			cfg.Captcha = v == "1" || v == "true"
 		}
 	}
 	return cfg, rows.Err()
 }
 
-// SetConfig persists the given fields (empty string / zero = leave unchanged).
+// SetConfig persists the service configuration. It is a full write: the
+// admin 服务配置 form submits the complete config, so the TLS/captcha
+// toggles and certificate fields are stored exactly as given (an empty
+// certificate clears it). handleConfigPut back-fills http_addr/retention
+// from the current row so a hand-written partial PUT cannot blank them.
 func (s *Store) SetConfig(c Config) error {
-	pairs := map[string]string{}
-	if c.HTTPAddr != "" {
-		pairs["http_addr"] = c.HTTPAddr
-	}
-	if c.RetentionDays > 0 {
-		pairs["retention_days"] = fmt.Sprintf("%d", c.RetentionDays)
+	pairs := map[string]string{
+		"http_addr":      c.HTTPAddr,
+		"retention_days": strconv.Itoa(c.RetentionDays),
+		"tls":            boolKV(c.TLS),
+		"tls_cert":       c.TLSCert,
+		"tls_key":        c.TLSKey,
+		"captcha":        boolKV(c.Captcha),
 	}
 	for k, v := range pairs {
 		if _, err := s.db.Exec(
@@ -1251,6 +1332,13 @@ func (s *Store) SetConfig(c Config) error {
 		}
 	}
 	return nil
+}
+
+func boolKV(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
 
 // ApplyRetention deletes rows older than retentionDays; returns deleted count.
@@ -1455,14 +1543,16 @@ func (s *Store) CreateUser(u User, password string) (User, error) {
 	if err != nil {
 		return u, err
 	}
-	res, err := s.db.Exec("INSERT INTO users(username, pass_hash, role, devices, created_at) VALUES(?,?,?,?,?)",
-		u.Username, hash, u.Role, u.Devices, time.Now().Unix())
+	res, err := s.db.Exec("INSERT INTO users(username, pass_hash, role, devices, created_at, tfa_required) VALUES(?,?,?,?,?,?)",
+		u.Username, hash, u.Role, u.Devices, time.Now().Unix(), u.TFARequired)
 	if err != nil {
 		return u, err
 	}
 	u.ID, _ = res.LastInsertId()
 	u.CreatedAt = time.Now().Unix()
 	u.PassHash = ""
+	u.TFASecret = ""
+	u.TFAEnabled = false
 	return u, nil
 }
 
@@ -1493,9 +1583,28 @@ func (s *Store) UpdateUser(id int64, role, devices, newPassword string) error {
 	return nil
 }
 
+// SetUserTFARequired toggles the admin-forced two-factor requirement for a
+// user (the user may still enroll voluntarily when it is off).
+func (s *Store) SetUserTFARequired(id int64, required bool) error {
+	v := 0
+	if required {
+		v = 1
+	}
+	_, err := s.db.Exec("UPDATE users SET tfa_required=? WHERE id=?", v, id)
+	return err
+}
+
+// SetUserTFASecret stores the user's enrolled TOTP secret, or clears it when
+// secret is empty (self-service disable, or an admin reset after the user
+// lost their authenticator).
+func (s *Store) SetUserTFASecret(id int64, secret string) error {
+	_, err := s.db.Exec("UPDATE users SET tfa_secret=? WHERE id=?", secret, id)
+	return err
+}
+
 // ListUsers returns all users without password hashes.
 func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query("SELECT id, username, role, devices, created_at FROM users ORDER BY id")
+	rows, err := s.db.Query("SELECT id, username, role, devices, created_at, tfa_required, (tfa_secret <> '') FROM users ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -1503,7 +1612,7 @@ func (s *Store) ListUsers() ([]User, error) {
 	var out []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Devices, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFAEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -1513,29 +1622,31 @@ func (s *Store) ListUsers() ([]User, error) {
 
 // GetUserByUsername returns a user (with hash) by name.
 func (s *Store) GetUserByUsername(name string) (*User, error) {
-	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at FROM users WHERE username=?", name)
+	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE username=?", name)
 	var u User
-	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFASecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	u.TFAEnabled = u.TFASecret != ""
 	return &u, nil
 }
 
 // GetUser returns a user (without hash) by id.
 func (s *Store) GetUser(id int64) (*User, error) {
-	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at FROM users WHERE id=?", id)
+	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE id=?", id)
 	var u User
-	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFASecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	u.TFAEnabled = u.TFASecret != ""
 	u.PassHash = ""
 	return &u, nil
 }
@@ -1584,10 +1695,10 @@ func (s *Store) CreateSession(userID int64, ttl time.Duration) (string, error) {
 // deleted and rejected.
 func (s *Store) GetUserByToken(token string) (*User, error) {
 	row := s.db.QueryRow(
-		"SELECT u.id, u.username, u.pass_hash, u.role, u.devices, u.created_at "+
+		"SELECT u.id, u.username, u.pass_hash, u.role, u.devices, u.created_at, u.tfa_required, u.tfa_secret "+
 			"FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?", token)
 	var u User
-	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFASecret)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1602,6 +1713,7 @@ func (s *Store) GetUserByToken(token string) (*User, error) {
 		s.DeleteSession(token)
 		return nil, nil
 	}
+	u.TFAEnabled = u.TFASecret != ""
 	u.PassHash = ""
 	return &u, nil
 }
