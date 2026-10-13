@@ -141,17 +141,40 @@ async function api(path, options) {
   }
   if (!res.ok) {
     const msg = data && data.error ? data.error : ('HTTP ' + res.status);
-    throw new Error(msg);
+    const e = new Error(msg);
+    e.status = res.status;
+    e.data = data;
+    throw e;
   }
   return data;
 }
 
+let liCaptchaEnabled = false; // 服务端是否开启算术验证码
+let liTotpRequired = false;   // 当前登录账户是否已启用两步验证
+
 function showLogin(msg) {
   setToken('');
   ME = null;
+  liTotpRequired = false;
+  $('li-totp-row').style.display = 'none';
+  $('li-totp').value = '';
   $('login-err').textContent = msg || '';
   $('login-bg').classList.add('open');
+  refreshLoginCaptcha();
   setTimeout(() => $('li-user').focus(), 60);
+}
+
+async function refreshLoginCaptcha() {
+  try {
+    const r = await api('/api/captcha');
+    liCaptchaEnabled = !!r.enabled;
+    $('li-cap-row').style.display = liCaptchaEnabled ? '' : 'none';
+    if (liCaptchaEnabled) {
+      $('li-cap-q').textContent = r.question || '';
+      $('li-cap-q').dataset.id = r.id || '';
+      $('li-cap').value = '';
+    }
+  } catch (e) { /* ignore */ }
 }
 
 async function setupAuth() {
@@ -184,24 +207,49 @@ $('login-form').addEventListener('submit', async (e) => {
   const btn = $('li-btn');
   btn.disabled = true;
   $('login-err').textContent = '';
+  const body = {
+    username: $('li-user').value.trim(),
+    password: $('li-pass').value,
+  };
+  if (liCaptchaEnabled) {
+    body.captcha_id = $('li-cap-q').dataset.id || '';
+    body.captcha_answer = $('li-cap').value.trim();
+  }
+  if (liTotpRequired) body.totp = $('li-totp').value.trim();
   try {
     const r = await api('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: $('li-user').value.trim(), password: $('li-pass').value }),
+      body: JSON.stringify(body),
     });
     setToken(r.token);
     ME = r.user;
+    liTotpRequired = false;
+    $('li-totp-row').style.display = 'none';
+    $('li-totp').value = '';
     applyMe();
     $('li-pass').value = '';
-    refreshLive(); refreshDash(); refreshDevices(); refreshUsers();
+    refreshLive(); refreshDash(); refreshDevices(); refreshUsersTable();
     toast('欢迎，' + ME.username);
+    if (r.tfa_setup_required) {
+      toast('管理员已要求你绑定两步验证，请完成设置', true);
+      openTFA();
+    }
   } catch (err) {
+    const d = err.data || {};
+    if (d.totp_required) {
+      liTotpRequired = true;
+      $('li-totp-row').style.display = '';
+      setTimeout(() => $('li-totp').focus(), 40);
+    }
+    if (liCaptchaEnabled) refreshLoginCaptcha();
     $('login-err').textContent = err.message;
   } finally {
     btn.disabled = false;
   }
 });
+
+$('li-cap-refresh').addEventListener('click', refreshLoginCaptcha);
 
 $('btn-logout').addEventListener('click', async () => {
   try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
@@ -227,7 +275,10 @@ $('btn-chgpwd').addEventListener('click', openPwd);
 $('pw-cancel').addEventListener('click', closePwd);
 pwdBg.addEventListener('click', (e) => { if (e.target === pwdBg) closePwd(); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && pwdBg.classList.contains('open')) closePwd();
+  if (e.key !== 'Escape') return;
+  if (pwdBg.classList.contains('open')) closePwd();
+  const t = $('tfa-bg');
+  if (t && t.classList.contains('open')) closeTFA();
 });
 
 $('pwd-form').addEventListener('submit', async (e) => {
@@ -258,6 +309,78 @@ $('pwd-form').addEventListener('submit', async (e) => {
     err.textContent = err2.message;
   } finally {
     btn.disabled = false;
+  }
+});
+
+/* ---------------- 两步验证 (Google Authenticator / TOTP) ---------------- */
+const tfaBg = $('tfa-bg');
+let tfaSecret = '';
+
+function openTFA() {
+  if (!tfaBg) return;
+  $('tfa-err').textContent = '';
+  const enabled = !!(ME && ME.tfa_enabled);
+  $('tfa-enabled-view').style.display = enabled ? '' : 'none';
+  $('tfa-setup-view').style.display = enabled ? 'none' : '';
+  $('tfa-off-pass').value = '';
+  tfaBg.classList.add('open');
+  if (!enabled) beginTFASetup();
+  else setTimeout(() => $('tfa-off-pass').focus(), 60);
+}
+function closeTFA() { if (tfaBg) tfaBg.classList.remove('open'); }
+
+async function beginTFASetup() {
+  try {
+    const r = await api('/api/me/tfa/setup', { method: 'POST' });
+    tfaSecret = r.secret;
+    $('tfa-qr').src = r.qr;
+    $('tfa-secret').textContent = r.secret;
+    $('tfa-code').value = '';
+    setTimeout(() => $('tfa-code').focus(), 60);
+  } catch (e) {
+    $('tfa-err').textContent = e.message;
+  }
+}
+
+$('btn-tfa').addEventListener('click', openTFA);
+$('tfa-cancel').addEventListener('click', closeTFA);
+if (tfaBg) tfaBg.addEventListener('click', (e) => { if (e.target === tfaBg) closeTFA(); });
+
+$('tfa-enable').addEventListener('click', async () => {
+  const code = $('tfa-code').value.trim();
+  if (code.length !== 6) { $('tfa-err').textContent = '请输入 6 位验证码'; return; }
+  $('tfa-err').textContent = '';
+  try {
+    await api('/api/me/tfa/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: tfaSecret, code }),
+    });
+    if (ME) ME.tfa_enabled = true;
+    toast('两步验证已启用');
+    closeTFA();
+    refreshUsersTable();
+  } catch (e) {
+    $('tfa-err').textContent = e.message;
+  }
+});
+
+$('tfa-disable').addEventListener('click', async () => {
+  const pw = $('tfa-off-pass').value;
+  if (!pw) { $('tfa-err').textContent = '请输入当前密码'; return; }
+  $('tfa-err').textContent = '';
+  try {
+    await api('/api/me/tfa/disable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (ME) ME.tfa_enabled = false;
+    toast('两步验证已关闭');
+    closeTFA();
+    refreshUsersTable();
+  } catch (e) {
+    $('tfa-err').textContent = e.message;
   }
 });
 
@@ -765,13 +888,21 @@ async function refreshUsersTable() {
       '<td>' + esc(u.username) + (u.id === ME.id ? ' <span class="faint">(当前)</span>' : '') + '</td>' +
       '<td>' + (u.role === 'admin' ? '<span class="badge dev">管理员</span>' : '<span class="badge proto">用户</span>') + '</td>' +
       '<td class="mono dim">' + esc(u.devices || '') + '</td>' +
+      '<td>' + tfaCell(u) + '</td>' +
       '<td class="faint">' + fmtTime(u.created_at) + '</td>' +
       '<td>' +
       '<button class="btn sm" data-u-edit="' + u.id + '">编辑</button> ' +
+      (u.tfa_enabled ? '<button class="btn sm warn" data-u-tfa-reset="' + u.id + '" title="清除该用户已绑定的验证器">重置2FA</button> ' : '') +
       (u.id !== ME.id ? '<button class="btn sm danger" data-u-del="' + u.id + '">删除</button>' : '') +
       '</td></tr>'
     ).join('');
   } catch (e) { /* 401 */ }
+}
+
+function tfaCell(u) {
+  if (u.tfa_enabled) return '<span class="badge sess">已启用</span>' + (u.tfa_required ? ' <span class="faint">(强制)</span>' : '');
+  if (u.tfa_required) return '<span class="badge proto">待绑定</span> <span class="faint">(强制)</span>';
+  return '<span class="faint">未启用</span>';
 }
 
 let editingUserId = 0;
@@ -784,6 +915,7 @@ function fillUserForm(u) {
   $('us-pass').placeholder = '留空则不修改密码';
   $('us-role').value = u.role;
   $('us-devices').value = u.role === 'admin' ? '*' : (u.devices || '');
+  $('us-tfa').checked = !!u.tfa_required;
   $('us-add').textContent = '保存修改(' + u.username + ')';
 }
 
@@ -792,6 +924,7 @@ $('us-add').addEventListener('click', async () => {
   const role = $('us-role').value;
   if (!name) { toast('请填写用户名', true); return; }
   const payload = { username: name, role };
+  payload.tfa_required = $('us-tfa').checked;
   if (role === 'admin') {
     payload.devices = '*';
   } else {
@@ -804,7 +937,12 @@ $('us-add').addEventListener('click', async () => {
       await api('/api/users/' + editingUserId, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role, devices: role === 'admin' ? '*' : devs, password: $('us-pass').value }),
+        body: JSON.stringify({
+          role,
+          devices: role === 'admin' ? '*' : devs,
+          password: $('us-pass').value,
+          tfa_required: $('us-tfa').checked,
+        }),
       });
       toast('用户已更新');
     } else {
@@ -820,6 +958,7 @@ $('us-add').addEventListener('click', async () => {
     $('us-name').disabled = false;
     $('us-pass').value = '';
     $('us-pass').placeholder = '密码(仅创建时填写)';
+    $('us-tfa').checked = false;
     $('us-add').textContent = '创建用户';
     refreshUsersTable();
   } catch (e) {
@@ -835,6 +974,23 @@ $('us-body').addEventListener('click', async (e) => {
       const u = (r.users || []).find(x => x.id === Number(editBtn.dataset.uEdit));
       if (u) fillUserForm(u);
     } catch (err) { /* ignore */ }
+    return;
+  }
+  const resetBtn = e.target.closest('button[data-u-tfa-reset]');
+  if (resetBtn) {
+    const id = Number(resetBtn.dataset.uTfaReset);
+    if (!confirm('确定重置该用户的两步验证？其现有验证器将失效，需重新绑定。')) return;
+    try {
+      await api('/api/users/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reset_tfa: true }),
+      });
+      toast('两步验证已重置');
+      refreshUsersTable();
+    } catch (err) {
+      if (err.message !== 'unauthorized') toast('重置失败: ' + err.message, true);
+    }
     return;
   }
   const delBtn = e.target.closest('button[data-u-del]');
@@ -861,16 +1017,38 @@ async function refreshConfig() {
     $('c-http').value = cfg.http_addr || '';
     $('c-keep').value = cfg.retention_days != null ? cfg.retention_days : '';
     $('c-db').textContent = cfg.db_path || '-';
+    $('c-proto').value = cfg.tls ? 'https' : 'http';
+    $('c-captcha').checked = !!cfg.captcha;
+    $('c-cert').value = cfg.tls_cert || '';
+    $('c-key').value = cfg.tls_key || '';
+    syncTLSFields();
   } catch (e) { /* 401 */ }
 }
 
+function syncTLSFields() {
+  const on = $('c-proto').value === 'https';
+  $('c-cert').disabled = !on;
+  $('c-key').disabled = !on;
+  $('c-cert').style.opacity = on ? '' : '.5';
+  $('c-key').style.opacity = on ? '' : '.5';
+}
+$('c-proto').addEventListener('change', syncTLSFields);
+
 $('c-save').addEventListener('click', async () => {
-  const body = {};
-  const http = $('c-http').value.trim();
-  const keep = parseInt($('c-keep').value, 10);
-  if (http && http !== cfgCache.http_addr) body.http_addr = http;
-  if (keep && keep !== cfgCache.retention_days) body.retention_days = keep;
-  if (Object.keys(body).length === 0) { toast('没有要保存的变更'); return; }
+  const http = $('c-http').value.trim() || (cfgCache ? cfgCache.http_addr : '');
+  const keep = parseInt($('c-keep').value, 10) || (cfgCache ? cfgCache.retention_days : 30);
+  const tlsOn = $('c-proto').value === 'https';
+  const cert = $('c-cert').value.trim();
+  const key = $('c-key').value.trim();
+  if (tlsOn && (!cert || !key)) { toast('启用 HTTPS 需填写证书与私钥 PEM', true); return; }
+  const body = {
+    http_addr: http,
+    retention_days: keep,
+    tls: tlsOn,
+    tls_cert: cert,
+    tls_key: key,
+    captcha: $('c-captcha').checked,
+  };
   try {
     const r = await api('/api/config', {
       method: 'PUT',
@@ -878,9 +1056,8 @@ $('c-save').addEventListener('click', async () => {
       body: JSON.stringify(body),
     });
     cfgCache = r.config;
-    $('c-http').value = r.config.http_addr;
-    $('c-keep').value = r.config.retention_days;
-    toast(r.restart_required ? '已保存。HTTP 监听地址变更需重启服务才能生效。' : '配置已保存并生效');
+    refreshConfig();
+    toast(r.restart_required ? '已保存。监听协议/证书变更需重启服务才能生效。' : '配置已保存并生效');
   } catch (e) {
     if (e.message !== 'unauthorized') toast('保存失败: ' + e.message, true);
   }

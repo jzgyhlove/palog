@@ -20,6 +20,18 @@
       <input id="li-user" name="username" autocomplete="username" placeholder="用户名" required autofocus>
       <label for="li-pass">密码</label>
       <input id="li-pass" name="password" type="password" autocomplete="current-password" placeholder="密码" required>
+      <div id="li-cap-row" style="display:none;">
+        <label for="li-cap">验证码</label>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span id="li-cap-q" class="mono" style="min-width:64px;"></span>
+          <input id="li-cap" inputmode="numeric" autocomplete="off" placeholder="答案" style="width:80px; flex:0 0 auto;">
+          <button class="btn sm" type="button" id="li-cap-refresh" title="换一题" style="margin:0;">换一题</button>
+        </div>
+      </div>
+      <div id="li-totp-row" style="display:none;">
+        <label for="li-totp">两步验证码</label>
+        <input id="li-totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Google Authenticator 6 位验证码">
+      </div>
       <button class="btn primary" type="submit" id="li-btn">登 录</button>
     </form>
     <div class="login-err" id="login-err"></div>
@@ -58,6 +70,7 @@
     <span class="live" id="live-dot">实时</span>
     <span id="live-stats" class="mono" title="包数 / 记录数 / 解析错误">-</span>
     <span class="who" id="whoami" title="">-</span>
+    <button class="btn sm" id="btn-tfa" title="Google 两步验证设置">两步验证</button>
     <button class="btn sm" id="btn-chgpwd" title="修改自己的登录密码">修改密码</button>
     <button class="btn sm" id="btn-logout" title="退出登录">退出</button>
   </div>
@@ -249,12 +262,13 @@
             <option value="admin">管理员</option>
           </select>
           <input id="us-devices" placeholder="可访问设备, 逗号分隔; * = 全部" style="width:260px;">
+          <label class="chk" style="white-space:nowrap;"><input type="checkbox" id="us-tfa"> 强制两步验证</label>
           <button class="btn primary" id="us-add">创建用户</button>
           <span class="spacer"></span>
           <span class="faint">admin 的 devices 固定为 *</span>
         </div>
         <div class="tbl-wrap"><table>
-          <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>可访问设备</th><th>创建时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>可访问设备</th><th>两步验证</th><th>创建时间</th><th>操作</th></tr></thead>
           <tbody id="us-body"></tbody>
         </table></div>
       </div>
@@ -268,6 +282,17 @@
             <label>HTTP 监听地址</label><input id="c-http" title="变更需重启服务">
             <label>数据保留(天)</label><input id="c-keep" type="number" min="1" max="3650">
             <label>数据库路径</label><span class="ro" id="c-db"></span>
+            <label>监听协议</label>
+            <select id="c-proto" title="HTTPS 需填写证书与私钥;变更需重启服务">
+              <option value="http">HTTP(不加密)</option>
+              <option value="https">HTTPS(证书加密)</option>
+            </select>
+            <label>登录验证码</label>
+            <label class="chk"><input type="checkbox" id="c-captcha"> 启用算术验证码(如 4 + 5 = ?)</label>
+            <label>TLS 证书(PEM)</label>
+            <textarea id="c-cert" rows="5" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----&#10;...(证书链,可在服务器证书后追加中间 CA)"></textarea>
+            <label>TLS 私钥(PEM)</label>
+            <textarea id="c-key" rows="5" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----&#10;..."></textarea>
           </div>
           <div style="margin-top:16px; display:flex; gap:8px;">
             <button class="btn primary" id="c-save">保存配置</button>
@@ -347,6 +372,35 @@
 </aside>
 
 <div id="toasts"></div>
+<!-- 两步验证设置覆盖层 -->
+<div class="login-bg" id="tfa-bg">
+  <div class="login-card" style="width:min(420px,92vw);">
+    <div class="brand" style="margin-bottom:14px;"><span class="dot"></span><b>palog</b></div>
+    <h1>Google 两步验证</h1>
+
+    <div id="tfa-enabled-view" style="display:none;">
+      <p class="sub">两步验证已启用,登录时需要输入 Google Authenticator 中的 6 位验证码。</p>
+      <label for="tfa-off-pass">当前密码(用于关闭)</label>
+      <input id="tfa-off-pass" type="password" autocomplete="current-password" placeholder="当前密码">
+      <button class="btn warn" type="button" id="tfa-disable" style="margin-top:12px;">关闭两步验证</button>
+    </div>
+
+    <div id="tfa-setup-view" style="display:none;">
+      <p class="sub">用 Google Authenticator(或兼容应用)扫描二维码;无法扫描时手动输入密钥。</p>
+      <div style="text-align:center; margin:6px 0 10px;">
+        <img id="tfa-qr" alt="TOTP 二维码" style="width:190px; height:190px; background:#fff; border-radius:8px; padding:6px;">
+      </div>
+      <label>密钥(手动输入)</label>
+      <div id="tfa-secret" style="word-break:break-all; font-family:var(--mono); font-size:12.5px; color:var(--text);"></div>
+      <label for="tfa-code">输入验证码以启用</label>
+      <input id="tfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 位验证码">
+      <button class="btn primary" type="button" id="tfa-enable" style="margin-top:12px;">启用两步验证</button>
+    </div>
+
+    <div class="login-err" id="tfa-err"></div>
+    <button class="btn" type="button" id="tfa-cancel" style="margin-top:8px;">关 闭</button>
+  </div>
+</div>
 <script src="/app.js"></script>
 </body>
 </html>

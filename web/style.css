@@ -215,6 +215,15 @@ pre.raw {
 }
 .config-form input:focus { border-color: var(--accent-2); }
 .config-form .ro { color: var(--text-faint); font-family: var(--mono); font-size: 12.5px; }
+.config-form select, .config-form textarea {
+  background: var(--bg-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 5px; padding: 7px 9px; font-size: 13px; outline: none; width: 100%;
+}
+.config-form textarea {
+  font-family: var(--mono); font-size: 11.5px; resize: vertical; white-space: pre; min-height: 74px;
+}
+.config-form select:focus, .config-form textarea:focus { border-color: var(--accent-2); }
+.config-form .chk { justify-self: start; margin: 0; }
 .health-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 14px; }
 .health-row .cell { background: var(--bg-2); border: 1px solid var(--border); border-radius: 5px; padding: 9px 12px; }
 .health-row .cell b { display: block; font-family: var(--mono); font-size: 16px; }
