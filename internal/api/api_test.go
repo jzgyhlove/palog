@@ -618,3 +618,313 @@ func readAll(r io.Reader) string {
 	b, _ := io.ReadAll(r)
 	return strings.TrimSpace(string(b))
 }
+
+/* ---------------- two-factor (TOTP) ---------------- */
+
+// TestTOTPVectors pins totpAt to the RFC 6238 appendix B SHA1 seed (the ASCII
+// string "12345678901234567890"), truncated to the 6 digits the UI asks for.
+func TestTOTPVectors(t *testing.T) {
+	const secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	cases := []struct {
+		unix int64
+		want string
+	}{
+		{59, "287082"},
+		{1111111109, "081804"},
+		{1111111111, "050471"},
+		{1234567890, "005924"},
+		{2000000000, "279037"},
+		{20000000000, "353130"},
+	}
+	for _, c := range cases {
+		got, err := totpAt(secret, time.Unix(c.unix, 0))
+		if err != nil {
+			t.Fatalf("totpAt(%d): %v", c.unix, err)
+		}
+		if got != c.want {
+			t.Errorf("totpAt(%d) = %s, want %s", c.unix, got, c.want)
+		}
+	}
+}
+
+func TestTOTPRoundTrip(t *testing.T) {
+	secret, err := newTOTPSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secret) != 32 {
+		t.Fatalf("secret length = %d, want 32 (160-bit base32)", len(secret))
+	}
+	code, err := totpAt(secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verifyTOTP(secret, code) {
+		t.Fatalf("current code %s rejected", code)
+	}
+	if verifyTOTP(secret, "abcdef") {
+		t.Fatal("non-numeric code accepted")
+	}
+	if verifyTOTP(secret, "12345") {
+		t.Fatal("short code accepted")
+	}
+	uri := otpauthURI("alice", secret)
+	if !strings.HasPrefix(uri, "otpauth://totp/") || !strings.Contains(uri, "secret="+secret) {
+		t.Fatalf("bad otpauth uri: %q", uri)
+	}
+	qr, err := qrDataURI(uri)
+	if err != nil {
+		t.Fatalf("qr: %v", err)
+	}
+	if !strings.HasPrefix(qr, "data:image/png;base64,") {
+		t.Fatalf("qr not a png data uri: %.40s", qr)
+	}
+}
+
+/* ---------------- login captcha ---------------- */
+
+func mustGet(t *testing.T, url string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	return resp
+}
+
+// solveCaptcha evaluates the "a + b = ?" style question the server issues.
+func solveCaptcha(t *testing.T, q string) string {
+	t.Helper()
+	f := strings.Fields(q)
+	if len(f) < 3 {
+		t.Fatalf("bad captcha question %q", q)
+	}
+	a, err1 := strconv.Atoi(f[0])
+	b, err2 := strconv.Atoi(f[2])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("bad captcha operands %q", q)
+	}
+	var v int
+	switch f[1] {
+	case "+":
+		v = a + b
+	case "-":
+		v = a - b
+	case "×":
+		v = a * b
+	default:
+		t.Fatalf("bad captcha op %q", f[1])
+	}
+	return strconv.Itoa(v)
+}
+
+func TestCaptchaFlow(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	// off by default: the endpoint says so and login needs no challenge.
+	r := decode[map[string]any](t, mustGet(t, ts.URL+"/api/captcha"))
+	if r["enabled"] != false {
+		t.Fatalf("captcha default enabled = %v, want false", r["enabled"])
+	}
+	login(t, ts, "admin", "adminpw")
+
+	// enable it (the admin form persists the whole config in one PUT).
+	if err := st.SetConfig(store.Config{HTTPAddr: ":8080", RetentionDays: 30, Captcha: true}); err != nil {
+		t.Fatal(err)
+	}
+	r = decode[map[string]any](t, mustGet(t, ts.URL+"/api/captcha"))
+	if r["enabled"] != true {
+		t.Fatalf("captcha still disabled after enabling: %v", r)
+	}
+	id, _ := r["id"].(string)
+	if id == "" || r["question"] == "" {
+		t.Fatalf("captcha missing id/question: %v", r)
+	}
+
+	// login without the challenge -> 400
+	resp := postJSON(ts.URL+"/api/login", `{"username":"admin","password":"adminpw"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("login without captcha status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// wrong answer -> 400
+	resp = postJSON(ts.URL+"/api/login",
+		`{"username":"admin","password":"adminpw","captcha_id":"`+id+`","captcha_answer":"-99999"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("login wrong captcha status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// fresh challenge + correct answer -> 200
+	r = decode[map[string]any](t, mustGet(t, ts.URL+"/api/captcha"))
+	id2, _ := r["id"].(string)
+	ans := solveCaptcha(t, r["question"].(string))
+	body := `{"username":"admin","password":"adminpw","captcha_id":"` + id2 + `","captcha_answer":"` + ans + `"}`
+	resp = postJSON(ts.URL+"/api/login", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login with captcha status %d, want 200: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+
+	// the challenge is single-use: replaying the same id -> 400
+	resp = postJSON(ts.URL+"/api/login", body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("reused captcha status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+/* ---------------- two-factor enrollment / login ---------------- */
+
+func TestTFAEndpoints(t *testing.T) {
+	ts, st := newTestServer(t)
+	utok, _ := login(t, ts, "user1", "userpw")
+	atok, _ := login(t, ts, "admin", "adminpw")
+
+	// enroll: setup returns a secret + QR but does NOT persist it.
+	setup := decode[map[string]any](t, doAuth(t, "POST", ts.URL+"/api/me/tfa/setup", utok, nil))
+	secret, _ := setup["secret"].(string)
+	if secret == "" {
+		t.Fatalf("setup missing secret: %v", setup)
+	}
+	if qr, _ := setup["qr"].(string); !strings.HasPrefix(qr, "data:image/png;base64,") {
+		t.Fatalf("setup qr not a data uri: %v", setup["qr"])
+	}
+
+	// wrong code -> 400 and still not enrolled.
+	resp := doAuth(t, "POST", ts.URL+"/api/me/tfa/enable", utok,
+		bytes.NewBufferString(`{"secret":"`+secret+`","code":"000000"}`))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("enable wrong code status %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if me := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/me", utok, nil)); me["tfa_enabled"] != false {
+		t.Fatalf("tfa_enabled true after failed enable: %v", me)
+	}
+
+	// correct code -> enrolled.
+	code, _ := totpAt(secret, time.Now())
+	resp = doAuth(t, "POST", ts.URL+"/api/me/tfa/enable", utok,
+		bytes.NewBufferString(`{"secret":"`+secret+`","code":"`+code+`"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("enable status %d, want 200: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+
+	// login now demands a TOTP code.
+	resp = postJSON(ts.URL+"/api/login", `{"username":"user1","password":"userpw"}`)
+	var lr map[string]any
+	json.NewDecoder(resp.Body).Decode(&lr)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized || lr["totp_required"] != true {
+		t.Fatalf("login without totp: status=%d body=%v", resp.StatusCode, lr)
+	}
+	// wrong code -> 401
+	resp = postJSON(ts.URL+"/api/login", `{"username":"user1","password":"userpw","totp":"000000"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("login wrong totp status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// correct code -> 200
+	code, _ = totpAt(secret, time.Now())
+	resp = postJSON(ts.URL+"/api/login", `{"username":"user1","password":"userpw","totp":"`+code+`"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login with totp status %d, want 200: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+
+	// disable re-checks the password.
+	resp = doAuth(t, "POST", ts.URL+"/api/me/tfa/disable", utok, bytes.NewBufferString(`{"password":"wrong"}`))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("disable wrong password status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doAuth(t, "POST", ts.URL+"/api/me/tfa/disable", utok, bytes.NewBufferString(`{"password":"userpw"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("disable status %d, want 200: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+	// password alone logs in again.
+	login(t, ts, "user1", "userpw")
+
+	// admin forces 2FA on a new user -> login signals enrollment is required.
+	resp = doAuth(t, "PUT", ts.URL+"/api/users", atok,
+		bytes.NewBufferString(`{"username":"user2","password":"pw2","role":"user","devices":"fw-1","tfa_required":true}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create forced user status %d: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+	resp = postJSON(ts.URL+"/api/login", `{"username":"user2","password":"pw2"}`)
+	json.NewDecoder(resp.Body).Decode(&lr)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || lr["tfa_setup_required"] != true {
+		t.Fatalf("forced-tfa login: status=%d body=%v", resp.StatusCode, lr)
+	}
+
+	// locate user2, enroll out-of-band, then admin reset clears enrollment
+	// but keeps the force flag.
+	var id2 int64
+	for _, uAny := range decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/users", atok, nil))["users"].([]any) {
+		u := uAny.(map[string]any)
+		if u["username"] == "user2" {
+			if u["tfa_required"] != true {
+				t.Fatalf("user2 not marked forced: %v", u)
+			}
+			id2 = int64(u["id"].(float64))
+		}
+	}
+	if id2 == 0 {
+		t.Fatal("user2 not found")
+	}
+	if err := st.SetUserTFASecret(id2, "ABCDEFGHIJKLMNOPQRSTUVWX"); err != nil {
+		t.Fatal(err)
+	}
+	resp = doAuth(t, "PUT", ts.URL+"/api/users/"+strconv.FormatInt(id2, 10), atok,
+		bytes.NewBufferString(`{"reset_tfa":true}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reset_tfa status %d: %s", resp.StatusCode, readAll(resp.Body))
+	}
+	resp.Body.Close()
+	for _, uAny := range decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/users", atok, nil))["users"].([]any) {
+		u := uAny.(map[string]any)
+		if u["username"] == "user2" {
+			if u["tfa_enabled"] != false {
+				t.Fatalf("reset_tfa did not clear enrollment: %v", u)
+			}
+			if u["tfa_required"] != true {
+				t.Fatalf("reset_tfa cleared the force flag: %v", u)
+			}
+		}
+	}
+}
+
+/* ---------------- TLS config via the API ---------------- */
+
+func TestConfigTLSViaAPI(t *testing.T) {
+	ts, _ := newTestServer(t)
+	atok, _ := login(t, ts, "admin", "adminpw")
+
+	// the admin form submits the full config in one PUT.
+	resp := doAuth(t, "PUT", ts.URL+"/api/config", atok,
+		bytes.NewBufferString(`{"http_addr":":8443","retention_days":30,"tls":true,"tls_cert":"CERTPEM","tls_key":"KEYPEM","captcha":false}`))
+	rr := decode[map[string]any](t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put tls config status %d: %v", resp.StatusCode, rr)
+	}
+	if rr["restart_required"] != true {
+		t.Fatalf("first TLS save restart_required = %v, want true", rr["restart_required"])
+	}
+	cfg := decode[map[string]any](t, doAuth(t, "GET", ts.URL+"/api/config", atok, nil))
+	if cfg["tls"] != true || cfg["tls_cert"] != "CERTPEM" || cfg["tls_key"] != "KEYPEM" {
+		t.Fatalf("tls config not persisted: %v", cfg)
+	}
+
+	// an identical save is a no-op and needs no restart.
+	resp2 := doAuth(t, "PUT", ts.URL+"/api/config", atok,
+		bytes.NewBufferString(`{"http_addr":":8443","retention_days":30,"tls":true,"tls_cert":"CERTPEM","tls_key":"KEYPEM","captcha":false}`))
+	rr2 := decode[map[string]any](t, resp2)
+	if rr2["restart_required"] != false {
+		t.Fatalf("no-op TLS save restart_required = %v, want false", rr2["restart_required"])
+	}
+}

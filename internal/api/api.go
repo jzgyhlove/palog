@@ -43,6 +43,11 @@ type Server struct {
 	// using separate servers don't leak state.
 	cacheMu    sync.RWMutex
 	cache      map[string]statsCacheEntry
+
+	// captchas holds pending login challenges (see captcha.go). Guarded by
+	// capMu and lazily initialised so a zero-value Server still works.
+	capMu    sync.Mutex
+	captchas map[string]captchaEntry
 }
 
 type ctxKey int
@@ -59,11 +64,15 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// public
 	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("GET /api/captcha", s.handleCaptcha)
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	// authenticated
 	mux.HandleFunc("POST /api/logout", s.auth(s.handleLogout))
 	mux.HandleFunc("GET /api/me", s.auth(s.handleMe))
 	mux.HandleFunc("PUT /api/me/password", s.auth(s.handleChangePassword))
+	mux.HandleFunc("POST /api/me/tfa/setup", s.auth(s.handleTFASetup))
+	mux.HandleFunc("POST /api/me/tfa/enable", s.auth(s.handleTFAEnable))
+	mux.HandleFunc("POST /api/me/tfa/disable", s.auth(s.handleTFADisable))
 	mux.HandleFunc("GET /api/stats", s.auth(s.handleStats))
 	mux.HandleFunc("GET /api/official-stats", s.auth(s.handleOfficialStats))
 	mux.HandleFunc("GET /api/logs", s.auth(s.handleLogs))
@@ -185,11 +194,18 @@ func (s *Server) counters() store.Counters {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		Totp          string `json:"totp"`
+		CaptchaID     string `json:"captcha_id"`
+		CaptchaAnswer string `json:"captcha_answer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if s.captchaEnabled() && !s.consumeCaptcha(in.CaptchaID, in.CaptchaAnswer) {
+		writeErr(w, http.StatusBadRequest, "验证码错误或已过期")
 		return
 	}
 	u, err := s.Store.GetUserByUsername(strings.TrimSpace(in.Username))
@@ -201,6 +217,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
+	// Two-factor: an enrolled account must also present a valid TOTP code.
+	if u.TFAEnabled {
+		if strings.TrimSpace(in.Totp) == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error":         "需要两步验证",
+				"totp_required": true,
+			})
+			return
+		}
+		if !verifyTOTP(u.TFASecret, in.Totp) {
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+				"error":         "两步验证码错误",
+				"totp_required": true,
+			})
+			return
+		}
+	}
 	tok, err := s.Store.CreateSession(u.ID, sessionTTL)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -208,8 +241,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("login", "user", u.Username)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"token": tok,
-		"user":  publicUser(u),
+		"token":              tok,
+		"user":               publicUser(u),
+		"tfa_setup_required": u.TFARequired && !u.TFAEnabled,
 	})
 }
 
@@ -279,10 +313,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 
 func publicUser(u *store.User) map[string]interface{} {
 	return map[string]interface{}{
-		"id":       u.ID,
-		"username": u.Username,
-		"role":     u.Role,
-		"devices":  u.Devices,
+		"id":           u.ID,
+		"username":     u.Username,
+		"role":         u.Role,
+		"devices":      u.Devices,
+		"tfa_required": u.TFARequired,
+		"tfa_enabled":  u.TFAEnabled,
 	}
 }
 
@@ -607,10 +643,11 @@ func (s *Server) handleUsersGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUsersPut(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		Role     string `json:"role"`
-		Devices  string `json:"devices"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		Role        string `json:"role"`
+		Devices     string `json:"devices"`
+		TFARequired bool   `json:"tfa_required"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -621,15 +658,16 @@ func (s *Server) handleUsersPut(w http.ResponseWriter, r *http.Request) {
 		devs = strings.Trim(devs, ",")
 	}
 	u, err := s.Store.CreateUser(store.User{
-		Username: in.Username,
-		Role:     in.Role,
-		Devices:  devs,
+		Username:    in.Username,
+		Role:        in.Role,
+		Devices:     devs,
+		TFARequired: in.TFARequired,
 	}, in.Password)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	slog.Info("user created", "username", u.Username, "role", u.Role)
+	slog.Info("user created", "username", u.Username, "role", u.Role, "tfa_required", u.TFARequired)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"user": publicUser(&u)})
 }
 
@@ -640,9 +678,11 @@ func (s *Server) handleUsersUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Role    string `json:"role"`
-		Devices string `json:"devices"`
-		Password string `json:"password"`
+		Role        string `json:"role"`
+		Devices     string `json:"devices"`
+		Password    string `json:"password"`
+		TFARequired *bool  `json:"tfa_required"`
+		ResetTFA    bool   `json:"reset_tfa"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -678,6 +718,19 @@ func (s *Server) handleUsersUpdate(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.UpdateUser(id, in.Role, devs, in.Password); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if in.TFARequired != nil {
+		if err := s.Store.SetUserTFARequired(id, *in.TFARequired); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if in.ResetTFA {
+		if err := s.Store.SetUserTFASecret(id, ""); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		slog.Info("two-factor reset by admin", "id", id)
 	}
 	slog.Info("user updated", "id", id)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -719,6 +772,21 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
 		return
 	}
+	cur, err := s.Store.GetConfig(s.DBPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A partial PUT must not blank the address/retention; the TLS and captcha
+	// toggles are taken as submitted (the admin form sends the full config).
+	if in.HTTPAddr == "" {
+		in.HTTPAddr = cur.HTTPAddr
+	}
+	if in.RetentionDays <= 0 {
+		in.RetentionDays = cur.RetentionDays
+	}
+	restart := in.HTTPAddr != cur.HTTPAddr || in.TLS != cur.TLS ||
+		in.TLSCert != cur.TLSCert || in.TLSKey != cur.TLSKey
 	if err := s.Store.SetConfig(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -730,7 +798,7 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"config":           cfg,
-		"restart_required": in.HTTPAddr != "",
+		"restart_required": restart,
 	})
 }
 
