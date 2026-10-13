@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"flag"
 	"log/slog"
 	"math/big"
@@ -103,7 +104,31 @@ func main() {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// HTTPS is configured in the console and stored in kv. The certificate is
+	// loaded in-process from the stored PEM, so nothing is written to disk; a
+	// missing or invalid certificate falls back to HTTP instead of refusing to
+	// start (the console stays reachable so the admin can fix it).
+	useTLS := false
+	if cfg.TLS {
+		switch cert, err := tls.X509KeyPair([]byte(cfg.TLSCert), []byte(cfg.TLSKey)); {
+		case cfg.TLSCert == "" || cfg.TLSKey == "":
+			slog.Error("tls enabled but certificate/key missing; serving HTTP")
+		case err != nil:
+			slog.Error("tls certificate invalid; serving HTTP", "err", err)
+		default:
+			httpSrv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			useTLS = true
+		}
+	}
 	go func() {
+		if useTLS {
+			slog.Info("https listening", "addr", cfg.HTTPAddr)
+			if err := httpSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				slog.Error("http server", "err", err)
+				stop()
+			}
+			return
+		}
 		slog.Info("http listening", "addr", cfg.HTTPAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("http server", "err", err)
