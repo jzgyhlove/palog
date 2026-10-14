@@ -22,6 +22,14 @@ const (
 	udpBufSize = 65536
 	batchSize  = 100
 	batchEvery = 200 * time.Millisecond
+
+	// Some Panabit firmware/export modes prepend a fixed 16-byte header before
+	// the PNB record (observed: "PANW\x00o be filled" followed by "<PNB0>HTTP4
+	// ...", on device "办公室测试"/40201). Detect the magic and re-anchor on the
+	// real PNB marker so those payloads parse like every other device instead of
+	// being counted as an unknown packet kind.
+	panabitHdrMagic = "PANW"
+	panabitHdrScan  = 128 // max bytes to scan for a PNB marker after the magic
 )
 
 // Listener is one live UDP device listener (for the health endpoint).
@@ -211,7 +219,30 @@ func (r *Receiver) readLoop(dl *deviceListener) {
 	}
 }
 
+// stripPanabitHeader drops a leading Panabit encapsulation header that some
+// firmware/export modes prepend (observed: the 16-byte "PANW\x00o be filled")
+// so the payload can be sniffed by its PNB marker. It is a no-op unless the
+// PANW magic is present AND a recognizable marker follows within panabitHdrScan
+// bytes, so it cannot corrupt a payload that merely starts with those letters.
+func stripPanabitHeader(data []byte) []byte {
+	if !bytes.HasPrefix(data, []byte(panabitHdrMagic)) {
+		return data
+	}
+	window := data
+	if len(window) > panabitHdrScan {
+		window = window[:panabitHdrScan]
+	}
+	if i := bytes.Index(window, []byte("PNB\x00")); i >= 0 {
+		return data[i:]
+	}
+	if i := bytes.Index(window, []byte("<PNB")); i >= 0 {
+		return data[i:]
+	}
+	return data
+}
+
 func (r *Receiver) handlePacket(device string, data []byte) {
+	data = stripPanabitHeader(data)
 	if bytes.HasPrefix(data, []byte("PNB\x00")) {
 		recs, perr := parse.ParseBinary(data)
 		atomic.AddInt64(&r.Packets, 1)

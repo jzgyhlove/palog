@@ -217,3 +217,70 @@ func TestNoDevicesStillServes(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+// panabitHeader is the 16-byte encapsulation header some Panabit firmware/export
+// modes prepend before the PNB record (observed on device "办公室测试"/40201).
+const panabitHeader = "PANW\x00o be filled"
+
+// smokeHTTP4 mimics the real 40201 payload: the PANW header is followed by a
+// "<PNB0>" (port 0) text record rather than "<PNB40201>".
+const smokeHTTP4 = "<PNB0>HTTP4 1791948336 6c-1f-f7-66-93-3e 172.16.16.93 65354 182.254.118.119 80 26 GET example.com /index.html _NULL_USER_"
+
+func TestStripPanabitHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain text unchanged", smokeText, smokeText},
+		{"panw text header stripped", panabitHeader + smokeHTTP4, smokeHTTP4},
+		{"panw binary header stripped", panabitHeader + "PNB\x00\x01\x02", "PNB\x00\x01\x02"},
+		{"panw without marker unchanged", panabitHeader + "garbage", panabitHeader + "garbage"},
+		{"plain binary unchanged", "PNB\x00\x01\x02", "PNB\x00\x01\x02"},
+	}
+	for _, c := range cases {
+		if got := stripPanabitHeader([]byte(c.in)); string(got) != c.want {
+			t.Fatalf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestPanabitHeaderDeviceIngested proves a device that prepends the PANW header
+// (like the 40201 one) now lands rows instead of counting as an unknown kind.
+func TestPanabitHeaderDeviceIngested(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "palog.db"))
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.UpsertDevice(store.Device{Name: "panw-1", Port: freeUDPPort(t), Enabled: true}); err != nil {
+		t.Fatalf("upsert panw-1: %v", err)
+	}
+
+	r := New(st, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return after cancel")
+		}
+	}()
+
+	p := listenerPort(t, r, "panw-1")
+	sendUDP(t, fmt.Sprintf("127.0.0.1:%d", p), []byte(panabitHeader+smokeHTTP4))
+
+	waitFor(t, func() bool { return atomic.LoadInt64(&r.Records) >= 1 }, "record from panw-1")
+	if got := atomic.LoadInt64(&r.ParseErrors); got != 0 {
+		t.Fatalf("parse errors = %d, want 0", got)
+	}
+	waitFor(t, func() bool {
+		total, items, err := st.Query(store.LogQuery{Device: "panw-1", Limit: 5})
+		return err == nil && total == 1 && len(items) == 1
+	}, "panw-1 row committed")
+}
