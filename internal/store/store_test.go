@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -182,6 +183,64 @@ func TestWarmup(t *testing.T) {
 	if err := empty.Warmup(); err != nil {
 		t.Fatalf("warmup on empty db: %v", err)
 	}
+}
+
+// TestWarmupProbesAreIndexBounded locks the invariant behind the live
+// incident. Warmup runs on the store's single pooled connection
+// (SetMaxOpenConns(1)); a probe that degrades to a full scan does not merely
+// run slowly, it pins that connection for the whole scan and starves the
+// receiver's per-second device reconcile (no UDP listeners get bound) and every
+// DB-backed HTTP handler. The incident: a top-N `GROUP BY domain ... ORDER BY
+// COUNT(*) DESC` probe scanned the entire ~19M-row idx_logs_domain (the planner
+// ignores (ts, domain) for that shape) and wedged ingest for hours. Every probe
+// must therefore be an index SEARCH.
+func TestWarmupProbesAreIndexBounded(t *testing.T) {
+	s := openTest(t)
+	// Populate mostly out-of-window rows so the ts-bounded probes are highly
+	// selective: an index is then the only sane plan, and a regression to a
+	// full scan shows up plainly as "SCAN logs".
+	old := time.Now().Unix() - 10*86400
+	batch := make([]Entry, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		batch = append(batch, Entry{RecvTS: old, Kind: "http", TS: old, Appid: i + 1})
+	}
+	if err := s.InsertBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, q := range warmupProbes(time.Now().Unix()-3600, time.Now().Unix()-24*3600) {
+		plan := explainPlan(t, s, q)
+		t.Logf("warmup probe plan: %s :: %s", plan, q)
+		if strings.Contains(plan, "SCAN logs") {
+			t.Fatalf("warmup probe must not full-scan logs\nplan: %s\nquery: %s", plan, q)
+		}
+		if !strings.Contains(plan, "SEARCH") {
+			t.Fatalf("warmup probe must be an index SEARCH\nplan: %s\nquery: %s", plan, q)
+		}
+	}
+}
+
+// explainPlan returns the joined EXPLAIN QUERY PLAN details for query.
+func explainPlan(t *testing.T, s *Store, query string) string {
+	t.Helper()
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN " + query)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(details, " | ")
 }
 
 // TestOpenRecoversPoisonedWAL simulates the live-deployment incident: a

@@ -1189,90 +1189,106 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	return out, nil
 }
 
+// warmupTimeout bounds Warmup so a pathological planner choice aborts instead
+// of running unbounded.
+const warmupTimeout = 60 * time.Second
+
 // Warmup primes the SQLite page cache so the first user request does not pay
 // the cold-cache cost of scanning the large index/tree pages. It runs the
-// exact aggregate queries the default dashboard paths execute:
-//  - the cheap official-stats COUNT+SUM scan over the trailing hour
-//  - the Stats() 24h hourly-bucket GROUP BY
-//  - the top-domain / top-src_ip probes used by full/rank deep-dives
-// and drives every logs index so its tree pages are cached.
+// aggregate queries the default dashboard paths execute (see warmupProbes).
+//
+// Two invariants keep warmup from ever wedging the service:
+//
+//  1. It runs on its OWN short-lived connection to the same file, never on the
+//     shared single-connection pool (SetMaxOpenConns(1)). A cold aggregate on a
+//     large table can take minutes; holding the pool's only connection would
+//     starve the receiver writer (ingest) and every DB-backed HTTP handler.
+//  2. It is bounded by warmupTimeout.
+//
+// Every probe must additionally be index-bounded. That is a correctness
+// requirement, not an optimisation: the live incident was a top-N
+// `GROUP BY domain ... ORDER BY COUNT(*) DESC` probe that scanned the entire
+// ~19M-row idx_logs_domain (the planner ignores (ts, domain) for that shape)
+// while it held the one connection, wedging ingest for hours. That probe is
+// gone and the remaining probes are all ts-bounded index SEARCHes;
+// TestWarmupProbesAreIndexBounded enforces this.
 func (s *Store) Warmup() error {
+	// A dedicated connection, so a cold aggregate can never hold the pool's
+	// only connection.
+	db, err := sql.Open("sqlite", s.dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	for _, pragma := range []string{
+		"PRAGMA busy_timeout=5000;",
+		"PRAGMA query_only=1;",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			return err
+		}
+	}
+
 	now := time.Now()
-	hour := now.Add(-time.Hour).Unix()
-	day := now.Add(-24 * time.Hour).Unix()
-
-	// All warmup work runs on a dedicated connection, kept out of the
-	// dashboard pool. The pool's single connection carries the ingest
-	// writer and dashboard readers; if the warmup's GROUP BYs ran on it,
-	// a checkpoint could commit under the long reader and grow the WAL
-	// unboundedly. A separate connection just warms its own page cache
-	// until it returns the pages to the OS on Close — harmless, and the
-	// first dashboard request after warmup re-reads the same hot pages
-	// from the OS cache instead of the SQLite cache.
-	conn, err := s.db.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	// q runs a single-row COUNT(*) probe on the dedicated warmup conn.
-	q := func(probe string, dest ...any) error {
-		return conn.QueryRowContext(context.Background(), probe).Scan(dest...)
-	}
-
-	var total, bytesIn, bytesOut int64
-	if err := q(
-		"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= "+strconv.FormatInt(hour, 10),
-		&total, &bytesIn, &bytesOut); err != nil {
-		return err
-	}
-	_ = total
-	_ = bytesIn
-	_ = bytesOut
-	// 24h hourly buckets (Stats trend sparkline).
-	rows, err := conn.QueryContext(context.Background(),
-		"SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= "+strconv.FormatInt(day, 10)+" GROUP BY h")
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var h, c int64
-		if err := rows.Scan(&h, &c); err != nil {
-			rows.Close()
-			return err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	// Top-N aggregates use the (ts, domain)/(ts, src_ip) composite indexes
-	// over the trailing hour; touch both so their tree pages are cached.
-	for _, col := range []string{"domain", "src_ip"} {
-		var probe int64
-		if err := q(
-			"SELECT COUNT(*) FROM (SELECT "+col+" FROM logs WHERE ts >= "+strconv.FormatInt(hour, 10)+
-				" AND "+col+" != '' GROUP BY "+col+" ORDER BY COUNT(*) DESC LIMIT 10)",
-			&probe); err != nil {
-			return err
-		}
-	}
-	// Single-row probes drive the remaining single-column indexes. Each is
-	// wrapped in COUNT(*) so a zero-match DB still returns exactly one row.
-	probes := []string{
-		"SELECT COUNT(*) FROM logs WHERE kind = ''",
-		"SELECT COUNT(*) FROM logs WHERE src_ip = ''",
-		"SELECT COUNT(*) FROM logs WHERE dst_ip = ''",
-		"SELECT COUNT(*) FROM logs WHERE device = ''",
-		"SELECT COUNT(*) FROM logs WHERE appid = 0",
-	}
-	for _, p := range probes {
-		var probe int64
-		if err := q(p, &probe); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
+	defer cancel()
+	for _, q := range warmupProbes(now.Add(-time.Hour).Unix(), now.Add(-24*time.Hour).Unix()) {
+		if err := drainQuery(ctx, db, q); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// drainQuery runs q to completion, discarding the rows. Probes return varying
+// column counts, so the scan destinations are sized from the result columns.
+func drainQuery(ctx context.Context, db *sql.DB, q string) error {
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	dest := make([]any, len(cols))
+	for i := range dest {
+		var v any
+		dest[i] = &v
+	}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// warmupProbes returns the cache-priming statements. Each MUST be bounded to a
+// small indexed range — a ts window or an equality seek — and never a bare
+// scan; see Warmup. Kept as a helper so tests can EXPLAIN every probe's plan.
+func warmupProbes(hour, day int64) []string {
+	return []string{
+		fmt.Sprintf("SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= %d", hour),
+		fmt.Sprintf("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs WHERE ts >= %d GROUP BY h", day),
+		"SELECT COUNT(*) FROM logs WHERE kind = ''",
+		"SELECT COUNT(*) FROM logs WHERE src_ip = ''",
+		"SELECT COUNT(*) FROM logs WHERE dst_ip = ''",
+		"SELECT COUNT(*) FROM logs WHERE device = ''",
+		warmupAppidProbe(hour),
+	}
+}
+
+// warmupAppidProbe is the appid cache-warming probe. It MUST stay ts-bounded:
+// the logs table has no single-column appid index, so a bare `WHERE appid = ?`
+// degrades to a full table scan which — on the store's single pooled
+// connection — starves ingest and the API (the live incident). The ts bound
+// makes it seek idx_logs_ts_appid instead.
+func warmupAppidProbe(hour int64) string {
+	return "SELECT COUNT(*) FROM logs WHERE ts >= " + strconv.FormatInt(hour, 10) + " AND appid = 0"
 }
 
 // GetConfig loads config from kv with defaults; dbPath comes from the flag.
