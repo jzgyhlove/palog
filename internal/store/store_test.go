@@ -220,6 +220,44 @@ func TestWarmupProbesAreIndexBounded(t *testing.T) {
 	}
 }
 
+func TestAggregateQueriesAreTsIndexBounded(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cases := []struct {
+		q    string
+		need string
+	}{
+		{
+			q:    "SELECT kind, COUNT(*) FROM logs INDEXED BY idx_logs_ts_kind WHERE ts>=0 GROUP BY kind",
+			need: "idx_logs_ts_kind",
+		},
+		{
+			q:    "SELECT device, COUNT(*) FROM logs INDEXED BY idx_logs_ts_device WHERE ts>=0 AND device!='' GROUP BY device ORDER BY 2 DESC LIMIT 100",
+			need: "idx_logs_ts_device",
+		},
+		{
+			q:    "SELECT domain, COUNT(*) AS c FROM logs INDEXED BY idx_logs_ts_domain WHERE ts>=0 AND domain!='' GROUP BY domain ORDER BY c DESC, domain ASC LIMIT 10",
+			need: "idx_logs_ts_domain",
+		},
+		{
+			q:    "SELECT src_ip, COUNT(*) AS c FROM logs INDEXED BY idx_logs_ts_src WHERE ts>=0 AND src_ip!='' GROUP BY src_ip ORDER BY c DESC, src_ip ASC LIMIT 10",
+			need: "idx_logs_ts_src",
+		},
+	}
+	for _, c := range cases {
+		plan := explainPlan(t, s, c.q)
+		if !strings.Contains(plan, "SEARCH") {
+			t.Fatalf("aggregate must be a SEARCH: plan=%s q=%s", plan, c.q)
+		}
+		if !strings.Contains(plan, c.need) {
+			t.Fatalf("missing expected index %s in plan: plan=%s q=%s", c.need, plan, c.q)
+		}
+	}
+}
+
 // explainPlan returns the joined EXPLAIN QUERY PLAN details for query.
 func explainPlan(t *testing.T, s *Store, query string) string {
 	t.Helper()

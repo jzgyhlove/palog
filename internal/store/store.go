@@ -254,8 +254,15 @@ func AppNameOf(appid int) string {
 }
 
 type Store struct {
-	db     *sql.DB
+	db  *sql.DB
+	rdb *sql.DB
+
 	dbPath string
+	// qTimeout bounds every read query so a pathological plan (or a huge
+	// window) cannot hold a read connection — and its WAL snapshot — open
+	// indefinitely. Reads run on rdb, so even a timeout can never block the
+	// write connection.
+	qTimeout time.Duration
 
 	// mu serializes every logs-table write (INSERT / UPDATE / DELETE /
 	// VACUUM) against each other. database/sql pools connections, so the
@@ -358,6 +365,13 @@ func Open(path string) (*Store, error) {
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA busy_timeout=60000;",
 		"PRAGMA read_uncommitted=1;",
+		// Cap WAL growth after a successful checkpoint: without this a
+		// burst of long readers can let the WAL grow to GBs (the live
+		// incident reached 5.1 GB), which in turn makes startup checkpoints
+		// minutes long. journal_size_limit is per-connection (SQLite does
+		// not persist it), hence it is set here on the write connection and
+		// via the read pool's DSN below.
+		"PRAGMA journal_size_limit=67108864;",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
 			db.Close()
@@ -380,22 +394,41 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("recover wal checkpoint: %w", err)
 	}
-	s := &Store{db: db, dbPath: path}
+	// Dedicated read-only pool. Reads and the writer must never share a
+	// connection: the live incident was a single /api/official-stats read
+	// holding the pool's only connection for ~29 minutes and starving the
+	// ingest writer (327k dropped records). In WAL mode readers do not
+	// block the writer, so a separate pool keeps them independent. The
+	// pragmas are per-connection, so they are supplied through the DSN for
+	// every pooled connection; query_only additionally makes an accidental
+	// write on a read path fail loudly instead of corrupting state.
+	rdb, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(60000)&_pragma=query_only(1)&_pragma=journal_size_limit(67108864)")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open sqlite (read): %w", err)
+	}
+	rdb.SetMaxOpenConns(4)
+	rdb.SetMaxIdleConns(4)
+	s := &Store{db: db, rdb: rdb, dbPath: path, qTimeout: 15 * time.Second}
 	// legacy DBs (pre multi-device) lack logs.device; add it before schema
 	// so that idx_logs_device can be created.
 	if err := s.migrateDeviceColumn(); err != nil {
+		rdb.Close()
 		db.Close()
 		return nil, fmt.Errorf("device column: %w", err)
 	}
 	if _, err := db.Exec(schema); err != nil {
+		rdb.Close()
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	if err := s.migrateLegacy(); err != nil {
+		rdb.Close()
 		db.Close()
 		return nil, fmt.Errorf("migrate legacy: %w", err)
 	}
 	if err := s.migrateUserTFA(); err != nil {
+		rdb.Close()
 		db.Close()
 		return nil, fmt.Errorf("migrate user tfa: %w", err)
 	}
@@ -543,7 +576,19 @@ func parseUDPPort(addr string) (int, error) {
 	return strconv.Atoi(addr)
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.rdb != nil {
+		s.rdb.Close()
+	}
+	return s.db.Close()
+}
+
+// readCtx bounds one read query. Reads run on the dedicated read pool, so
+// this protects the caller (and the WAL snapshot the read holds) from an
+// unbounded plan without ever touching the write connection.
+func (s *Store) readCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s.qTimeout)
+}
 
 // writeTx runs fn holding the write mutex, inside one transaction on a
 // dedicated connection.
@@ -703,10 +748,26 @@ func (s *Store) Query(q LogQuery) (int64, []Entry, error) {
 	if q.Limit > 1000 {
 		q.Limit = 1000
 	}
+	// Scan guard: a query with no lower time bound cannot use the ts-leading
+	// indexes and degenerates into a full scan of every indexed column (the
+	// live incident's multi-minute reads). The API always sets a window
+	// (default trailing hour); only an explicit from=0 reaches here, and we
+	// clamp that to the trailing week rather than scan all history.
+	if q.From == 0 {
+		q.From = time.Now().Unix() - 7*86400
+	}
 	where, args := buildWhere(q)
 
+	ctx, cancel := s.readCtx()
+	defer cancel()
+
+	// Cap the total. An uncapped COUNT(*) re-scans every matching row and
+	// was a large share of the incident's cost; 100001 lets the UI show an
+	// exact count for any realistic result and a capped "100000+" beyond it,
+	// without an unbounded scan.
 	var total int64
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+where, args...).Scan(&total); err != nil {
+	if err := s.rdb.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM (SELECT 1 FROM logs"+where+" LIMIT 100001)", args...).Scan(&total); err != nil {
 		return 0, nil, err
 	}
 	order := "DESC"
@@ -715,7 +776,7 @@ func (s *Store) Query(q LogQuery) (int64, []Entry, error) {
 	}
 	sqlStr := "SELECT " + logCols + " FROM logs" + where +
 		" ORDER BY ts " + order + ", id " + order + " LIMIT ? OFFSET ?"
-	rows, err := s.db.Query(sqlStr, append(args, q.Limit, q.Offset)...)
+	rows, err := s.rdb.QueryContext(ctx, sqlStr, append(args, q.Limit, q.Offset)...)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -733,7 +794,9 @@ func (s *Store) Query(q LogQuery) (int64, []Entry, error) {
 
 // Get returns one entry by id.
 func (s *Store) Get(id int64) (*Entry, error) {
-	row := s.db.QueryRow("SELECT "+logCols+" FROM logs WHERE id = ?", id)
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	row := s.rdb.QueryRowContext(ctx, "SELECT "+logCols+" FROM logs WHERE id = ?", id)
 	e, err := scanEntry(row.Scan)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -778,6 +841,9 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 
 	scope, sargs := scopeCond(devices)
 
+	ctx, cancel := s.readCtx()
+	defer cancel()
+
 	// 24 contiguous hourly buckets ending at the current hour (UTC labels).
 	now := time.Now().UTC()
 	curHour := now.Truncate(time.Hour)
@@ -787,7 +853,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		hWhere += " AND " + scope
 		hArgs = append(hArgs, sargs...)
 	}
-	rows, err := s.db.Query("SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
+	rows, err := s.rdb.QueryContext(ctx, "SELECT (ts/3600)*3600 AS h, COUNT(*) FROM logs"+hWhere+" GROUP BY h", hArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -822,7 +888,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 		baseWhere += " AND " + scope
 		baseArgs = append(baseArgs, sargs...)
 	}
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
+	if err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+baseWhere, baseArgs...).Scan(&st.Total); err != nil {
 		return nil, err
 	}
 	st.LastHour = st.Total
@@ -833,10 +899,13 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 	return st, nil
 }
 
-// topValues returns the top n values of col for rows in the given where
-// clause (which must include a ts guard to stay fast).
-func (s *Store) topValues(col string, n int, where string, args []interface{}) ([]CountValue, error) {
-	// col is an internal constant, never user input.
+// topValues returns the top n values of col for rows matching where (which
+// must include a ts guard to stay fast). indexBy names the ts-leading
+// composite index to force: left to itself the planner scans the whole
+// single-column index and ignores the ts bound (the live incident's
+// multi-minute GROUP BYs).
+func (s *Store) topValues(col, indexBy string, n int, where string, args []interface{}) ([]CountValue, error) {
+	// col and indexBy are internal constants, never user input.
 	// Append col != '' filter to the provided where clause.
 	fullWhere := where
 	if fullWhere == "" {
@@ -846,8 +915,10 @@ func (s *Store) topValues(col string, n int, where string, args []interface{}) (
 	}
 	fullArgs := append([]interface{}{}, args...)
 	fullArgs = append(fullArgs, n)
-	rows, err := s.db.Query(
-		"SELECT "+col+", COUNT(*) AS c FROM logs"+fullWhere+" GROUP BY "+col+" ORDER BY c DESC LIMIT ?", fullArgs...)
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx,
+		"SELECT "+col+", COUNT(*) AS c FROM logs INDEXED BY "+indexBy+fullWhere+" GROUP BY "+col+" ORDER BY c DESC, "+col+" ASC LIMIT ?", fullArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -887,6 +958,9 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	out.Security.ParseErrors = c.ParseErrors
 
 	scope, sargs := scopeCond(devices)
+
+	ctx, cancel := s.readCtx()
+	defer cancel()
 
 	// timeCond + timeArgs: the caller-provided ts window.
 	var timeCond string
@@ -971,7 +1045,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	traffic := func() error {
 		var total int64
 		var bytesIn, bytesOut int64
-		if err := s.db.QueryRow(
+		if err := s.rdb.QueryRowContext(ctx,
 			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+trafficBase,
 			trafficArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
 			return err
@@ -983,7 +1057,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		if hasWindow {
 			out.Traffic.LastHour = total
 		} else {
-			if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Traffic.LastHour); err != nil {
+			if err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Traffic.LastHour); err != nil {
 				return err
 			}
 		}
@@ -994,7 +1068,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		// Computed on every path (including cheap) so the 系统概况 1h
 		// view shows 日志类型分布 and 设备分布 without the heavy extras.
 		out.Traffic.ByKind = map[string]int64{}
-		rows, err := s.db.Query("SELECT kind, COUNT(*) FROM logs"+trafficBase+" GROUP BY kind", trafficArgs...)
+		rows, err := s.rdb.QueryContext(ctx, "SELECT kind, COUNT(*) FROM logs INDEXED BY idx_logs_ts_kind"+trafficBase+" GROUP BY kind", trafficArgs...)
 		if err != nil {
 			return err
 		}
@@ -1013,8 +1087,8 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		devWhere := trafficBase
 		devArgs := append([]interface{}{}, trafficArgs...)
 		devWhere += " AND device != ''"
-		devRows, err := s.db.Query(
-			"SELECT device, COUNT(*) FROM logs"+devWhere+
+		devRows, err := s.rdb.QueryContext(ctx,
+			"SELECT device, COUNT(*) FROM logs INDEXED BY idx_logs_ts_device"+devWhere+
 				" GROUP BY device ORDER BY 2 DESC LIMIT 100", devArgs...)
 		if err != nil {
 			return err
@@ -1042,7 +1116,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	if hasWindow {
 		out.Security.LastHour = out.Traffic.TotalRecords
 	} else if out.Security.LastHour == 0 {
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Security.LastHour); err != nil {
+		if err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Security.LastHour); err != nil {
 			return nil, err
 		}
 	}
@@ -1077,7 +1151,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			ipWhere += rankCond
 			ipArgs = append(ipArgs, rankArgs...)
 		}
-		rows, err := s.db.Query(
+		rows, err := s.rdb.QueryContext(ctx,
 			"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
 				" GROUP BY 1 ORDER BY 3 DESC LIMIT 20", ipArgs...)
 		if err != nil {
@@ -1110,7 +1184,7 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			appWhere += rankCond
 			appArgs = append(appArgs, rankArgs...)
 		}
-		appRows, err := s.db.Query(
+		appRows, err := s.rdb.QueryContext(ctx,
 			"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
 		if err != nil {
 			return nil, err
@@ -1154,17 +1228,17 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 
 		// Top domains
 		var err error
-		if out.TopDomains, err = s.topValues("domain", 10, extraWhere, extraArgs); err != nil {
+		if out.TopDomains, err = s.topValues("domain", "idx_logs_ts_domain", 10, extraWhere, extraArgs); err != nil {
 			return nil, err
 		}
 		// Top source IPs
-		if out.TopSrcIP, err = s.topValues("src_ip", 10, extraWhere, extraArgs); err != nil {
+		if out.TopSrcIP, err = s.topValues("src_ip", "idx_logs_ts_src", 10, extraWhere, extraArgs); err != nil {
 			return nil, err
 		}
 
 		// Recent records within the window (last 10) — deep-dive only.
 		if full {
-			recentRows, err := s.db.Query(
+			recentRows, err := s.rdb.QueryContext(ctx,
 				"SELECT "+logCols+" FROM logs"+extraWhere+
 					" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
 			if err != nil {
@@ -1199,43 +1273,19 @@ const warmupTimeout = 60 * time.Second
 //
 // Two invariants keep warmup from ever wedging the service:
 //
-//  1. It runs on its OWN short-lived connection to the same file, never on the
-//     shared single-connection pool (SetMaxOpenConns(1)). A cold aggregate on a
-//     large table can take minutes; holding the pool's only connection would
-//     starve the receiver writer (ingest) and every DB-backed HTTP handler.
+//  1. It runs on the dedicated read pool (query_only). A cold aggregate on a
+//     large table can take minutes; holding the write connection would starve
+//     ingest and every DB-backed HTTP handler. The read pool is independent.
 //  2. It is bounded by warmupTimeout.
 //
-// Every probe must additionally be index-bounded. That is a correctness
-// requirement, not an optimisation: the live incident was a top-N
-// `GROUP BY domain ... ORDER BY COUNT(*) DESC` probe that scanned the entire
-// ~19M-row idx_logs_domain (the planner ignores (ts, domain) for that shape)
-// while it held the one connection, wedging ingest for hours. That probe is
-// gone and the remaining probes are all ts-bounded index SEARCHes;
-// TestWarmupProbesAreIndexBounded enforces this.
+// Every probe must additionally be index-bounded; TestWarmupProbesAreIndexBounded
+// enforces this.
 func (s *Store) Warmup() error {
-	// A dedicated connection, so a cold aggregate can never hold the pool's
-	// only connection.
-	db, err := sql.Open("sqlite", s.dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	for _, pragma := range []string{
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA query_only=1;",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			return err
-		}
-	}
-
 	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
 	defer cancel()
 	for _, q := range warmupProbes(now.Add(-time.Hour).Unix(), now.Add(-24*time.Hour).Unix()) {
-		if err := drainQuery(ctx, db, q); err != nil {
+		if err := drainQuery(ctx, s.rdb, q); err != nil {
 			return err
 		}
 	}
@@ -1298,7 +1348,9 @@ func (s *Store) GetConfig(dbPath string) (Config, error) {
 		RetentionDays: 30,
 		DBPath:        dbPath,
 	}
-	rows, err := s.db.Query("SELECT key, value FROM kv")
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, "SELECT key, value FROM kv")
 	if err != nil {
 		return cfg, err
 	}
@@ -1385,7 +1437,9 @@ func (s *Store) ApplyRetention(retentionDays int) (int64, error) {
 
 // ListDevices returns all devices ordered by name.
 func (s *Store) ListDevices() ([]Device, error) {
-	rows, err := s.db.Query("SELECT id, name, port, enabled FROM devices ORDER BY name")
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, "SELECT id, name, port, enabled FROM devices ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -1405,7 +1459,9 @@ func (s *Store) ListDevices() ([]Device, error) {
 
 // ListEnabledDevices returns only enabled devices.
 func (s *Store) ListEnabledDevices() ([]Device, error) {
-	rows, err := s.db.Query("SELECT id, name, port, enabled FROM devices WHERE enabled=1 ORDER BY name")
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, "SELECT id, name, port, enabled FROM devices WHERE enabled=1 ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -1620,7 +1676,9 @@ func (s *Store) SetUserTFASecret(id int64, secret string) error {
 
 // ListUsers returns all users without password hashes.
 func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query("SELECT id, username, role, devices, created_at, tfa_required, (tfa_secret <> '') FROM users ORDER BY id")
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, "SELECT id, username, role, devices, created_at, tfa_required, (tfa_secret <> '') FROM users ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -1638,7 +1696,9 @@ func (s *Store) ListUsers() ([]User, error) {
 
 // GetUserByUsername returns a user (with hash) by name.
 func (s *Store) GetUserByUsername(name string) (*User, error) {
-	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE username=?", name)
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	row := s.rdb.QueryRowContext(ctx, "SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE username=?", name)
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFASecret)
 	if err == sql.ErrNoRows {
@@ -1653,7 +1713,9 @@ func (s *Store) GetUserByUsername(name string) (*User, error) {
 
 // GetUser returns a user (without hash) by id.
 func (s *Store) GetUser(id int64) (*User, error) {
-	row := s.db.QueryRow("SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE id=?", id)
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	row := s.rdb.QueryRowContext(ctx, "SELECT id, username, pass_hash, role, devices, created_at, tfa_required, tfa_secret FROM users WHERE id=?", id)
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.PassHash, &u.Role, &u.Devices, &u.CreatedAt, &u.TFARequired, &u.TFASecret)
 	if err == sql.ErrNoRows {
@@ -1689,7 +1751,9 @@ func (s *Store) DeleteUser(id int64) error {
 // CountUsers returns the total user count.
 func (s *Store) CountUsers() (int64, error) {
 	var n int64
-	err := s.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n)
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&n)
 	return n, err
 }
 
@@ -1710,7 +1774,9 @@ func (s *Store) CreateSession(userID int64, ttl time.Duration) (string, error) {
 // GetUserByToken resolves a session token to its user; expired tokens are
 // deleted and rejected.
 func (s *Store) GetUserByToken(token string) (*User, error) {
-	row := s.db.QueryRow(
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	row := s.rdb.QueryRowContext(ctx,
 		"SELECT u.id, u.username, u.pass_hash, u.role, u.devices, u.created_at, u.tfa_required, u.tfa_secret "+
 			"FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?", token)
 	var u User
@@ -1722,7 +1788,7 @@ func (s *Store) GetUserByToken(token string) (*User, error) {
 		return nil, err
 	}
 	var expires int64
-	if err := s.db.QueryRow("SELECT expires FROM sessions WHERE token=?", token).Scan(&expires); err != nil {
+	if err := s.rdb.QueryRowContext(ctx, "SELECT expires FROM sessions WHERE token=?", token).Scan(&expires); err != nil {
 		return nil, err
 	}
 	if expires < time.Now().Unix() {
