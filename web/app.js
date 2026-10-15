@@ -1,3 +1,5 @@
+function decodePath(p){if(!p)return "";try{return decodeURIComponent(p)}catch(e){return p}}
+
 /* palog 日志审计控制台 — vanilla JS,无构建步骤
  * 多设备(端口命名) + 多用户(按设备授权) + Bearer token 鉴权
  */
@@ -480,7 +482,7 @@ async function renderDrawer(item) {
     ['协议', item.proto === 6 ? 'TCP(6)' : item.proto === 17 ? 'UDP(17)' : (item.proto || '')],
     ['MAC', item.mac], ['接口', item.iface], ['对端接口', item.iface2],
     ['应用 ID', item.appid >= 0 ? (appNameOf(item.appid) ? appNameOf(item.appid) + ' (' + item.appid + ')' : String(item.appid)) : ''],
-    ['域名', item.domain], ['Host', item.host], ['路径', item.path],
+    ['域名', item.domain], ['Host', item.host], ['路径', decodePath(item.path)],
     ['方法', item.method], ['用户', item.user],
     ['流入字节', item.bytes_in], ['流出字节', item.bytes_out],
     ['计数器', item.counters ? JSON.stringify(item.counters) : ''],
@@ -579,7 +581,7 @@ function recentRow(item) {
     '<td class="mono">' + ipPort(item.src_ip, item.src_port) + '</td>' +
     '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
     '<td class="mono trunc">' + esc(target || '') + '</td>' +
-    '<td class="mono trunc">' + esc(path || '') + '</td>' +
+    '<td class="mono trunc">' + esc(decodePath(path)) + '</td>' +
     '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
     '</tr>';
@@ -710,7 +712,7 @@ function auditRow(item) {
     '<td class="mono">' + ipPort(item.dst_ip, item.dst_port) + '</td>' +
     '<td>' + protoBadge(item.proto) + '</td>' +
     '<td class="mono trunc">' + esc(target || '') + '</td>' +
-    '<td class="mono trunc wide">' + esc(path || '') + '</td>' +
+    '<td class="mono trunc wide">' + esc(decodePath(path)) + '</td>' +
     '<td>' + appidBadge(item.appid) + '</td>' +
     '<td class="mono dim">' + fmtBytes(item.bytes_in) + ' / ' + fmtBytes(item.bytes_out) + '</td>' +
     '</tr>';
