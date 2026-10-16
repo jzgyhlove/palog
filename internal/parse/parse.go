@@ -8,6 +8,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"palog/internal/xcharset"
 )
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,14 @@ func ParseText(line string) (TextLog, error) {
 	default:
 		return TextLog{}, fmt.Errorf("unknown line kind %q", f[0])
 	}
+	// normalize potential GBK/invalid UTF-8 fields
+	t.Path = xcharset.ToUTF8(t.Path)
+	t.Host = xcharset.ToUTF8(t.Host)
+	t.Method = xcharset.ToUTF8(t.Method)
+	t.User = xcharset.ToUTF8(t.User)
+	t.Domain = xcharset.ToUTF8(t.Domain)
+	t.MAC = xcharset.ToUTF8(t.MAC)
+	t.Raw = xcharset.ToUTF8(t.Raw)
 	return t, nil
 }
 
@@ -319,6 +329,13 @@ func ParseBinary(buf []byte) ([]Record, error) {
 			}
 			off = voff + ln
 		}
+		// normalize string fields
+		rec.Iface = xcharset.ToUTF8(rec.Iface)
+		rec.Iface2 = xcharset.ToUTF8(rec.Iface2)
+		rec.MAC = xcharset.ToUTF8(rec.MAC)
+		rec.Src = xcharset.ToUTF8(rec.Src)
+		rec.Dst = xcharset.ToUTF8(rec.Dst)
+		rec.Domain = xcharset.ToUTF8(rec.Domain)
 		recs = append(recs, rec)
 
 		// Gap scan: next record header is always 4-aligned; skip filler bytes.

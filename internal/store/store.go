@@ -21,6 +21,7 @@ import (
 
 	"crypto/pbkdf2" // stdlib since Go 1.24
 
+	"palog/internal/xcharset"
 	_ "modernc.org/sqlite"
 )
 
@@ -674,6 +675,17 @@ func scanEntry(scan func(dest ...interface{}) error) (Entry, error) {
 	if extra != "" {
 		json.Unmarshal([]byte(extra), &e.Extra)
 	}
+	// normalize legacy GBK/invalid UTF-8 fields on read
+	e.Iface = xcharset.ToUTF8(e.Iface)
+	e.Iface2 = xcharset.ToUTF8(e.Iface2)
+	e.MAC = xcharset.ToUTF8(e.MAC)
+	e.Domain = xcharset.ToUTF8(e.Domain)
+	e.Host = xcharset.ToUTF8(e.Host)
+	e.Path = xcharset.ToUTF8(e.Path)
+	e.Method = xcharset.ToUTF8(e.Method)
+	e.User = xcharset.ToUTF8(e.User)
+	e.Raw = xcharset.ToUTF8(e.Raw)
+	e.Device = xcharset.ToUTF8(e.Device)
 	return e, nil
 }
 
