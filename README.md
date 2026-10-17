@@ -9,7 +9,7 @@ Go 单二进制实现的网络日志审计平台:接收 Panabit发送的日志,�
 - **多设备接入**:每台 Panabit 对应一个命名 UDP 端口(如 `panabit` → `40200`),日志自动按设备打标存储
 - **协议解析**:支持 Panabit 文本日志(`dnsquery3` / `HTTP4` / `qqlogin3`)与 PNB 二进制 TLV 记录包(会话、流量统计),由真实抓包逆向验证
 - **多用户 RBAC**:`admin` / `user` 两种角色,普通用户按设备授权;用户可自助修改密码
-- **查询与统计**:仪表盘实时速率、日志类型分布、Top 域名/源 IP、24 小时趋势;日志查询支持全文搜索、设备/类型/时间/排序过滤与分页
+- **查询与统计**:仪表盘实时速率、日志类型分布、Top 域名/源 IP、24 小时趋势;日志查询支持全文搜索、设备/类型/时间/排序过滤与分页;系统概况与流量分析的长窗口(7/30 天)由按小时预聚合表加速
 - **数据保留**:按天自动清理过期日志与过期会话令牌
 - **HTTPS 与访问防护**:内置 HTTPS——粘贴 PEM 证书链与私钥即可直接对外,无需反向代理;可选登录算术验证码防暴力破解;支持两步验证(2FA,基于 Google Authenticator 的 TOTP),用户可自助启用,管理员可对指定用户强制启用并一键重置
 - **安全**:密码 PBKDF2-SHA256 加盐存储;Bearer token 会话(12 小时);全程无明文凭据外泄
@@ -28,6 +28,8 @@ Panabit ──UDP──▶ palog  ├── UDP 监听器(receiver.reconcile 每
 数据流:`UDP 包 → 解析 → 归一化 Entry → 批事务落库 → 查询/统计接口 → Web 控制台`
 
 **写入与查询隔离**:SQLite 连接池固定为单写连接(`SetMaxOpenConns(1)`),接收端以「每 100 条 / 200ms」批量提交事务以避免写竞争;启动时的 page-cache 预热(`store.Warmup`)在**独立只读连接**上运行、受 60s 超时约束,且每条预热语句都必须是走索引的 `SEARCH`(由 `TestWarmupProbesAreIndexBounded` 用 `EXPLAIN QUERY PLAN` 守住),保证预热既不会占用写连接、也不会退化为全表扫描而拖慢接收与接口。
+
+**长窗口预聚合(rollup)**:「系统概况 / 流量分析」的聚合另有一层按小时的派生表——`agg_hour` 记 `小时 + 设备 + 日志类型` 的条数与上下行字节,`agg_dim` 记 `小时` 上的域名 / 源 IP / IP 排名键 / 应用 ID 计数,`rollup_state` 记录折叠进度。后台 worker 每秒按 `logs.id` 单调推进,首次启动自动回填全部历史;`logs` 表及其全部索引不受影响,仍是唯一事实来源,预聚合丢失或落后都可按 id 重放重建(聚合可加,故重放幂等)。读取时**整点小时**取自预聚合表、窗口首尾**不完整的小时**取自 `logs`,两者在 Go 侧合并;仅当预聚合被证明完整时才启用(见 `store.rollupReady`:下界与折叠前沿校验),否则整个面板回退到原始查询,因此启用它不会改变任何一个数字。数据保留清理会同步删除过期的小时桶。
 
 ## 支持解析的日志格式
 
@@ -231,7 +233,7 @@ bash deploy/e2e_check.sh <admin密码>
 │   ├── parse/                # PNB 日志解析(文本行 + 二进制 TLV)、golden 回归测试
 │   ├── receiver/             # UDP 监听、设备 reconcile、批量落库
 │   ├── api/                  # REST API + 鉴权中间件(RBAC/设备范围)
-│   └── store/                # SQLite 存储(devices/users/sessions/logs/kv)
+│   └── store/                # SQLite 存储(devices/users/sessions/logs/kv + 按小时预聚合 agg_hour/agg_dim/rollup_state)
 ├── web/                      # 前端(vanilla JS,go:embed 内嵌)
 ├── tools/diag_pcap/          # pcap 抓包诊断工具(解析成功率/错误分类)
 ├── deploy/                   # 部署脚本、systemd 单元、E2E 冒烟脚本
