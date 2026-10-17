@@ -3,6 +3,7 @@ package parse
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -132,6 +133,70 @@ func TestBinaryAgainstGolden(t *testing.T) {
 		t.Errorf("total records %d, want 1503", total)
 	}
 	t.Logf("validated %d packets / %d records against golden", len(payloads), total)
+}
+
+// loadHexPayloads reads testdata/<name>, where every non-empty, non-comment line
+// is a hex-encoded PNB payload.
+func loadHexPayloads(t *testing.T, name string) [][]byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "..", "testdata", name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	var out [][]byte
+	for ln, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		raw, err := hex.DecodeString(line)
+		if err != nil {
+			t.Fatalf("%s line %d: bad hex: %v", name, ln+1, err)
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+// TestBinaryLayoutB guards the layout-A/layout-B split: real firmware packets
+// whose first record uses the opaque 28-byte region must be detected as layoutB
+// and decoded with an empty (never binary) iface/MAC while still recovering the
+// IPv4 tuple and domain TLVs.
+func TestBinaryLayoutB(t *testing.T) {
+	payloads := loadHexPayloads(t, "layout_b.txt")
+	if len(payloads) == 0 {
+		t.Fatal("no layout B fixtures")
+	}
+	var records, tuples, domains int
+	for i, pl := range payloads {
+		t0 := int(binary.LittleEndian.Uint32(pl[12:16]))
+		if got := detectLayout(pl, t0); got != layoutB {
+			t.Fatalf("packet %d: detectLayout=%d, want layoutB", i, got)
+		}
+		got, _ := ParseBinary(pl)
+		if len(got) == 0 {
+			t.Errorf("packet %d: no records decoded", i)
+		}
+		for _, r := range got {
+			if r.Iface != "" || r.MAC != "" {
+				t.Errorf("packet %d: layout B record has iface=%q mac=%q, want empty", i, r.Iface, r.MAC)
+			}
+			if r.Src != "" {
+				tuples++
+			}
+			if r.Domain != "" {
+				domains++
+			}
+		}
+		records += len(got)
+	}
+	if tuples == 0 {
+		t.Error("layout B: no IPv4 tuple recovered")
+	}
+	if domains == 0 {
+		t.Error("layout B: no domain recovered")
+	}
+	t.Logf("layout B: %d packets / %d records / %d tuples / %d domains", len(payloads), records, tuples, domains)
 }
 
 func compareRecord(t *testing.T, pkt, rec int, got Record, want goldenRecord) {

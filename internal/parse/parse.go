@@ -200,8 +200,22 @@ const (
 	hdrLen       = 20
 	recHdrLen    = 4
 	recFixedLen  = 16 // ts1 ts2 bytesIn bytesOut
+	regionBLen   = 28 // layout B opaque region (7x u32 LE)
 	tsWindowBack = 259200
 	tsWindowFwd  = 3600
+)
+
+// Record region layouts. Panabit firmware emits two variants under the same
+// "PNB\0" magic (both observed live; see docs/PROTOCOL.md):
+//
+//	layoutA: <iface NUL-terminated ASCII> <x u8> <mac 6B>  (variable length)
+//	layoutB: 28 opaque bytes                               (no ASCII iface)
+//
+// The layout is not self-describing, so ParseBinary infers it from the first
+// record's region (see detectLayout).
+const (
+	layoutA = iota
+	layoutB
 )
 
 // isHeader reports whether b[off:] starts a valid record header,
@@ -225,11 +239,103 @@ func isHeader(b []byte, off, t0 int) bool {
 // ParseBinary decodes a whole PNB binary packet (payload beginning with "PNB\0").
 // It returns every record decoded so far plus the first structural error, if any.
 // It never panics on malformed input.
+//
+// The record region layout (see layoutA/layoutB) is not self-describing, so it is
+// inferred from the first record (detectLayout) and the stream is then walked once
+// under that layout. Deriving the layout from a fixed early window keeps the result
+// identical for any truncation of the buffer past that window, which the
+// truncation-recovery invariant depends on.
 func ParseBinary(buf []byte) ([]Record, error) {
 	if len(buf) < hdrLen || string(buf[0:4]) != "PNB\x00" {
 		return nil, fmt.Errorf("bad magic or truncated header")
 	}
 	t0 := int(binary.LittleEndian.Uint32(buf[12:16]))
+	return parseRecords(buf, t0, detectLayout(buf, t0))
+}
+
+// detectLayout infers the region layout (layoutA/layoutB) from the first record.
+// The two layouts differ only in the region following the fixed part: layoutA
+// begins with a short printable-ASCII NUL-terminated iface name, whereas layoutB's
+// 28-byte region is opaque (binary or zero). We inspect only the first record's
+// 16-byte region window, so the decision depends solely on bytes [20,56) and is
+// therefore stable under truncation past that window. When there is no first
+// record, neither layout produces any records, so layoutA is returned.
+//
+// The iface prefix must be at least 2 bytes (minIfacePrefix) and pass
+// plausibleIface: a lone printable byte before the NUL is not a real iface name
+// (observed names are "eth1"/"eth2") but is exactly what a layoutB region's
+// first u32 produces when its low byte lands in the printable range and its
+// second byte is zero (e.g. 7a 00 00 00). Treating that as layoutA misaligns the
+// walk and surfaces the region as a binary iface. Requiring >=2 name-like bytes
+// plus a unicast-looking MAC tail rejects those counters while staying stable
+// under truncation.
+func detectLayout(buf []byte, t0 int) int {
+	if !isHeader(buf, hdrLen, t0) {
+		return layoutA
+	}
+	o := hdrLen + recHdrLen + recFixedLen // first record's region offset
+	for p := 0; p < 16; p++ {
+		if o+p >= len(buf) {
+			break
+		}
+		if buf[o+p] != 0 {
+			continue
+		}
+		// NUL at p: layoutA iff a plausible (>=2 byte) iface name precedes it.
+		if p >= minIfacePrefix && plausibleIface(buf, o, p) {
+			return layoutA
+		}
+		return layoutB
+	}
+	return layoutB
+}
+
+// minIfacePrefix is the shortest leading printable-ASCII run before a NUL that we
+// accept as a layoutA iface name. One-byte runs are rejected because they are the
+// signature of a layoutB region (u32 whose low byte is printable, high byte zero).
+const minIfacePrefix = 2
+
+// plausibleIface reports whether the p bytes at buf[o:] look like a layout-A
+// interface name rather than the leading bytes of a layout-B opaque region.
+//
+// Two independent invariants are checked:
+//
+//   - Charset: real names (observed "eth1"/"eth2") are ASCII letters/digits plus
+//     a few separators. A layout-B region is 7 little-endian u32 counters, so its
+//     bytes frequently land in the printable range by chance (e.g. 0x2237 ->
+//     "7\"") but rarely form a clean name.
+//   - Tail: layout A continues with a 1-byte flag then a 6-byte source MAC, which
+//     is always unicast (the I/G bit is clear). When those bytes are in the buffer
+//     we require the MAC to look unicast, which rejects counters like 0x22378d.
+//
+// The check only reads bytes up to o+p+2, keeping the decision a function of a
+// short prefix (stable under later truncation).
+func plausibleIface(buf []byte, o, p int) bool {
+	for _, c := range buf[o : o+p] {
+		if !isIfaceChar(c) {
+			return false
+		}
+	}
+	if mo := o + p + 2; mo < len(buf) {
+		return buf[mo]&1 == 0
+	}
+	return true
+}
+
+// isIfaceChar reports whether c can appear in an interface name.
+func isIfaceChar(c byte) bool {
+	switch {
+	case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		return true
+	case c == '_' || c == '-' || c == '.' || c == '/' || c == ':':
+		return true
+	}
+	return false
+}
+
+// parseRecords walks the record stream of an already-validated PNB payload
+// under the given region layout.
+func parseRecords(buf []byte, t0, layout int) ([]Record, error) {
 	off := hdrLen
 	var recs []Record
 
@@ -250,26 +356,35 @@ func ParseBinary(buf []byte) ([]Record, error) {
 		rec.BytesOut = binary.LittleEndian.Uint32(buf[off+12:])
 		off += recFixedLen
 
-		z := -1
-		for i := off; i < len(buf); i++ {
-			if buf[i] == 0 {
-				z = i
-				break
+		if layout == layoutB {
+			// Layout B: opaque region; this firmware exports no ASCII iface/MAC,
+			// so those fields stay empty (never binary garbage in the DB).
+			if off+regionBLen > len(buf) {
+				return recs, fmt.Errorf("truncated region at offset %d", off)
 			}
-		}
-		if z < 0 || z-off > 64 {
-			return recs, fmt.Errorf("unterminated iface at offset %d", off)
-		}
-		rec.Iface = string(buf[off:z])
-		off = z + 1
+			off += regionBLen
+		} else {
+			z := -1
+			for i := off; i < len(buf); i++ {
+				if buf[i] == 0 {
+					z = i
+					break
+				}
+			}
+			if z < 0 || z-off > 64 {
+				return recs, fmt.Errorf("unterminated iface at offset %d", off)
+			}
+			rec.Iface = string(buf[off:z])
+			off = z + 1
 
-		if off+7 > len(buf) {
-			return recs, fmt.Errorf("truncated x+mac at offset %d", off)
+			if off+7 > len(buf) {
+				return recs, fmt.Errorf("truncated x+mac at offset %d", off)
+			}
+			rec.X = buf[off]
+			rec.MAC = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
+				buf[off+1], buf[off+2], buf[off+3], buf[off+4], buf[off+5], buf[off+6])
+			off += 7
 		}
-		rec.X = buf[off]
-		rec.MAC = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-			buf[off+1], buf[off+2], buf[off+3], buf[off+4], buf[off+5], buf[off+6])
-		off += 7
 
 		// TLV stream until 0x00 terminator (or an out-of-band next header).
 		for off < len(buf) {
@@ -298,6 +413,13 @@ func ParseBinary(buf []byte) ([]Record, error) {
 				rec.Dst = net.IP(val[4:8]).String()
 				rec.Sport = int(binary.BigEndian.Uint16(val[8:10]))
 				rec.Dport = int(binary.BigEndian.Uint16(val[10:12]))
+				rec.HasTuple = true
+			case t == 0x02 && ln == 36:
+				// IPv6 flow tuple: 16 src + 16 dst + 2 sport + 2 dport (big endian).
+				rec.Src = net.IP(val[0:16]).String()
+				rec.Dst = net.IP(val[16:32]).String()
+				rec.Sport = int(binary.BigEndian.Uint16(val[32:34]))
+				rec.Dport = int(binary.BigEndian.Uint16(val[34:36]))
 				rec.HasTuple = true
 			case t == 0x01 && ln == 36:
 				// IPv6: 16 src + 16 dst + 2 sport + 2 dport (big endian)
