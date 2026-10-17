@@ -160,6 +160,48 @@ func main() {
 		}()
 	}
 
+	// Hourly rollup maintenance: folds newly inserted rows into agg_hour /
+	// agg_dim so the heavy long-window 系统概况 / 流量分析 panels can be served
+	// from roughly 1/20th of the rows instead of scanning `logs` for 60s.
+	// Starting from rollup_state.last_id = 0 it also backfills all existing
+	// history, so no separate migration step is needed. It runs on the
+	// read-only pool and commits short transactions, so it never joins the
+	// ingest transaction — a read starving the writer is the exact incident
+	// this package was hardened against.
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var folded int64
+		lastLog := time.Now()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			n, err := st.RollupTick(20000)
+			if err != nil {
+				slog.Warn("rollup", "err", err)
+				continue
+			}
+			folded += int64(n)
+			if time.Since(lastLog) < time.Minute {
+				continue
+			}
+			lastLog = time.Now()
+			lag, lerr := st.RollupLag()
+			if lerr != nil {
+				slog.Warn("rollup lag", "err", lerr)
+				continue
+			}
+			if lag > 0 {
+				slog.Info("rollup backfill", "folded", folded, "lag", lag)
+			} else {
+				slog.Info("rollup current", "folded", folded)
+			}
+		}
+	}()
+
 	<-ctx.Done()
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -349,7 +350,49 @@ CREATE TABLE IF NOT EXISTS sessions (
   user_id INTEGER NOT NULL,
   expires INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);`
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
+-- Hourly rollups for the heavy long-window 系统概况 / 流量分析 panels.
+-- They are pure derived state: the logs table stays the source of truth, so a
+-- lost or stale rollup can always be rebuilt by replaying ids. agg_hour
+-- carries the dimensions whose cardinality is tiny (a handful of kinds, a
+-- handful of devices) and is enough for totals / by_kind / by_device / the
+-- trend. agg_dim carries the value lists (domains, source IPs, the COALESCE IP
+-- ranking key, app ids) keyed by hour: measured live cardinality is only
+-- ~3400 domains and ~290 source IPs per 24h, so this stays exact -- no Top-K
+-- approximation, no sketching -- at roughly 5 percent of the logs table.
+-- The primary key is (dim, device, value, hour) so that the dominant query
+-- ("top values of one dim over an hour range") reads a contiguous run and
+-- aggregates with a streaming scan instead of a temp B-tree.
+CREATE TABLE IF NOT EXISTS agg_hour (
+  hour INTEGER NOT NULL,
+  device TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  bytes_in INTEGER NOT NULL,
+  bytes_out INTEGER NOT NULL,
+  PRIMARY KEY (hour, device, kind)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS agg_dim (
+  dim TEXT NOT NULL,
+  device TEXT NOT NULL,
+  value TEXT NOT NULL,
+  hour INTEGER NOT NULL,
+  n INTEGER NOT NULL,
+  bytes INTEGER NOT NULL,
+  PRIMARY KEY (dim, device, value, hour)
+) WITHOUT ROWID;
+-- rollup_state is a single row: the highest logs.id already folded into the
+-- rollups. Advancing it happens in the same transaction as the upserts, so a
+-- crash mid-batch simply replays that batch (the aggregates are additive and
+-- therefore idempotent on replay). Starting from 0 backfills all history.
+CREATE TABLE IF NOT EXISTS rollup_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_id INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO rollup_state(id, last_id, updated_at) VALUES (1, 0, 0);
+CREATE INDEX IF NOT EXISTS idx_agg_hour_hour ON agg_hour(hour);
+CREATE INDEX IF NOT EXISTS idx_agg_dim_hour ON agg_dim(hour);`
 
 // Open opens (and migrates) the database at path.
 func Open(path string) (*Store, error) {
@@ -971,6 +1014,340 @@ func (s *Store) topValues(ctx context.Context, col, indexBy string, n int, where
 	return out, rows.Err()
 }
 
+/* ---------------- rollup-backed reads ---------------- */
+
+// rollupWindow is the split of a request window into the whole hours the
+// rollups can answer and the partial hours at each edge that must still be read
+// from logs. agg_hour is keyed by hourBucket(ts), so a partially requested hour
+// can never be served from it without over- or under-counting.
+type rollupWindow struct {
+	fullFrom, fullTo int64 // inclusive hour starts
+	hasFull          bool
+	headFrom, headTo int64 // inclusive ts range preceding fullFrom
+	hasHead          bool
+	tailFrom, tailTo int64 // inclusive ts range following fullTo's hour
+	hasTail          bool
+}
+
+// rollupFrontierMargin keeps the read path away from the newest folded row.
+// Rows are folded in id order while a request window is measured in ts order,
+// so an hour this close to the frontier could still receive a late (backdated)
+// row. One hour is far beyond the ingest's own reordering.
+const rollupFrontierMargin = 3600
+
+// splitRollupWindow divides the inclusive ts window [from,to] into whole hours
+// and the partial hours at each edge. The returned parts never overlap and
+// together cover exactly [from,to].
+func splitRollupWindow(from, to int64) rollupWindow {
+	if from <= 0 || to <= 0 || to < from {
+		return rollupWindow{}
+	}
+	firstFull := hourBucket(from)
+	lastFull := hourBucket(to)
+	if from > firstFull {
+		firstFull += 3600 // the hour `from` lands in is only partially requested
+	}
+	if to < lastFull+3599 {
+		lastFull -= 3600 // the hour `to` lands in is only partially requested
+	}
+	if firstFull > lastFull {
+		// Fewer than two whole hours are covered: read the window from logs.
+		return rollupWindow{headFrom: from, headTo: to, hasHead: true}
+	}
+	w := rollupWindow{fullFrom: firstFull, fullTo: lastFull, hasFull: true}
+	if from < firstFull {
+		w.headFrom, w.headTo, w.hasHead = from, firstFull-1, true
+	}
+	if to > lastFull+3599 {
+		w.tailFrom, w.tailTo, w.hasTail = lastFull+3600, to, true
+	}
+	return w
+}
+
+// rawParts lists the ranges still served from logs (the partial edge hours).
+func (w rollupWindow) rawParts() [][2]int64 {
+	var out [][2]int64
+	if w.hasHead {
+		out = append(out, [2]int64{w.headFrom, w.headTo})
+	}
+	if w.hasTail {
+		out = append(out, [2]int64{w.tailFrom, w.tailTo})
+	}
+	return out
+}
+
+// rollupHourFloor is the earliest hour the rollups can answer exactly. Below
+// MIN(hour) there is no bucket at all, and MIN(hour) itself may be an hour that
+// retention has only partially pruned. 0 means "not usable".
+func (s *Store) rollupHourFloor() (int64, error) {
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	var min int64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT COALESCE(MIN(hour),0) FROM agg_hour").Scan(&min); err != nil {
+		return 0, err
+	}
+	if min == 0 {
+		return 0, nil
+	}
+	return min + 3600, nil
+}
+
+// rollupFrontierTs is the ts of the newest row folded into the rollups; 0 when
+// unknown (nothing folded yet, or that row has since been pruned).
+func (s *Store) rollupFrontierTs() (int64, error) {
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	var lastID int64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT last_id FROM rollup_state WHERE id = 1").Scan(&lastID); err != nil {
+		return 0, err
+	}
+	if lastID == 0 {
+		return 0, nil
+	}
+	var ts int64
+	switch err := s.rdb.QueryRowContext(ctx, "SELECT ts FROM logs WHERE id = ?", lastID).Scan(&ts); {
+	case err == sql.ErrNoRows:
+		return 0, nil
+	case err != nil:
+		return 0, err
+	}
+	return ts, nil
+}
+
+// rollupReady reports whether every whole hour in w is provably complete in the
+// rollups, so serving them instead of scanning logs cannot change a number.
+func (s *Store) rollupReady(w rollupWindow) (bool, error) {
+	if !w.hasFull {
+		return false, nil
+	}
+	floor, err := s.rollupHourFloor()
+	if err != nil || floor == 0 || w.fullFrom < floor {
+		return false, err
+	}
+	frontier, err := s.rollupFrontierTs()
+	if err != nil || frontier == 0 {
+		return false, err
+	}
+	// The whole rolled-up range must sit at least one hour behind the newest
+	// folded row, otherwise a backdated row could still move one of its hours.
+	if w.fullTo+3599 > frontier-rollupFrontierMargin {
+		return false, nil
+	}
+	return true, nil
+}
+
+// scoped appends a device-scope predicate to a query that already carries its
+// own WHERE ... placeholders.
+func scoped(q string, scope string, scopeArgs, args []interface{}) (string, []interface{}) {
+	if scope == "" {
+		return q, args
+	}
+	return q + " AND " + scope, append(args, scopeArgs...)
+}
+
+// countsRows runs a (text key, integer) GROUP BY and returns it as a map.
+func (s *Store) countsRows(ctx context.Context, q string, args ...interface{}) (map[string]int64, error) {
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var k string
+		var n int64
+		if err := rows.Scan(&k, &n); err != nil {
+			return nil, err
+		}
+		out[k] = n
+	}
+	return out, rows.Err()
+}
+
+// pairRows runs a (text key, integer, integer) GROUP BY into key -> [2]int64.
+func (s *Store) pairRows(ctx context.Context, q string, args ...interface{}) (map[string][2]int64, error) {
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][2]int64{}
+	for rows.Next() {
+		var k string
+		var a, b int64
+		if err := rows.Scan(&k, &a, &b); err != nil {
+			return nil, err
+		}
+		out[k] = [2]int64{a, b}
+	}
+	return out, rows.Err()
+}
+
+// rawTotals sums the row count and byte totals of logs over an inclusive range.
+func (s *Store) rawTotals(ctx context.Context, from, to int64, scope string, scopeArgs []interface{}) (total, in, out int64, err error) {
+	q, args := scoped("SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= ? AND ts <= ?",
+		scope, scopeArgs, []interface{}{from, to})
+	err = s.rdb.QueryRowContext(ctx, q, args...).Scan(&total, &in, &out)
+	return
+}
+
+// aggTotals sums the same aggregates from agg_hour over an inclusive hour range.
+func (s *Store) aggTotals(ctx context.Context, from, to int64, scope string, scopeArgs []interface{}) (total, in, out int64, err error) {
+	q, args := scoped("SELECT COALESCE(SUM(n),0), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM agg_hour WHERE hour >= ? AND hour <= ?",
+		scope, scopeArgs, []interface{}{from, to})
+	err = s.rdb.QueryRowContext(ctx, q, args...).Scan(&total, &in, &out)
+	return
+}
+
+// rollupHourCounts aggregates agg_hour by col over the rollup's whole hours and
+// merges in the partial edge hours read from logs. The raw side is index-hinted
+// (an unhinted GROUP BY over the trailing range degenerates into a full
+// single-column index scan — the incident behind topValues) and carries no
+// LIMIT, because a truncated edge list would corrupt the merge.
+func (s *Store) rollupHourCounts(ctx context.Context, w rollupWindow, col, rawIndex string, scope string, scopeArgs []interface{}) (map[string]int64, error) {
+	q, args := scoped("SELECT "+col+", SUM(n) FROM agg_hour WHERE hour >= ? AND hour <= ? GROUP BY 1",
+		scope, scopeArgs, []interface{}{w.fullFrom, w.fullTo})
+	out, err := s.countsRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range w.rawParts() {
+		rq, rargs := scoped("SELECT "+col+", COUNT(*) FROM logs INDEXED BY "+rawIndex+" WHERE ts >= ? AND ts <= ? GROUP BY 1",
+			scope, scopeArgs, []interface{}{p[0], p[1]})
+		m, err := s.countsRows(ctx, rq, rargs...)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range m {
+			out[k] += v
+		}
+	}
+	return out, nil
+}
+
+// rollupDimCounts is rollupHourCounts for an agg_dim partition. rawCol/rawExtra
+// describe the logs-side aggregate (e.g. rawCol "domain" with rawExtra
+// " AND domain != ''") so the partial hours are read with the same semantics as
+// the scan path.
+func (s *Store) rollupDimCounts(ctx context.Context, w rollupWindow, dim, rawCol, rawIndex, rawExtra string, scope string, scopeArgs []interface{}) (map[string]int64, error) {
+	q, args := scoped("SELECT value, SUM(n) FROM agg_dim WHERE dim = ? AND hour >= ? AND hour <= ? GROUP BY 1",
+		scope, scopeArgs, []interface{}{dim, w.fullFrom, w.fullTo})
+	out, err := s.countsRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range w.rawParts() {
+		rq, rargs := scoped("SELECT "+rawCol+", COUNT(*) FROM logs INDEXED BY "+rawIndex+" WHERE ts >= ? AND ts <= ?"+rawExtra+" GROUP BY 1",
+			scope, scopeArgs, []interface{}{p[0], p[1]})
+		m, err := s.countsRows(ctx, rq, rargs...)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range m {
+			out[k] += v
+		}
+	}
+	return out, nil
+}
+
+// rollupIPCounts aggregates the IP ranking (records AND bytes) over the rollup's
+// whole hours plus the partial edges from logs. The rollup key is the same
+// COALESCE expression the scan path groups by.
+func (s *Store) rollupIPCounts(ctx context.Context, w rollupWindow, scope string, scopeArgs []interface{}) (map[string][2]int64, error) {
+	q, args := scoped("SELECT value, SUM(n), SUM(bytes) FROM agg_dim WHERE dim = ? AND hour >= ? AND hour <= ? GROUP BY 1",
+		scope, scopeArgs, []interface{}{rollupDimIP, w.fullFrom, w.fullTo})
+	out, err := s.pairRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range w.rawParts() {
+		rq, rargs := scoped("SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in+bytes_out),0) FROM logs WHERE ts >= ? AND ts <= ? AND (src_ip != '' OR dst_ip != '') GROUP BY 1",
+			scope, scopeArgs, []interface{}{p[0], p[1]})
+		m, err := s.pairRows(ctx, rq, rargs...)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range m {
+			d := out[k]
+			d[0] += v[0]
+			d[1] += v[1]
+			out[k] = d
+		}
+	}
+	return out, nil
+}
+
+// topCounts turns a value->count map into the top n CountValues ordered by
+// count DESC then value ASC — the same order topValues' raw query uses, so the
+// rollup path and the scan path tie-break identically.
+func topCounts(m map[string]int64, n int) []CountValue {
+	out := make([]CountValue, 0, len(m))
+	for k, v := range m {
+		if k == "" {
+			continue
+		}
+		out = append(out, CountValue{Value: k, Count: v})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Value < out[j].Value
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// topPairs turns an IP -> (records, bytes) map into the top n by bytes.
+func topPairs(m map[string][2]int64, n int) []IPRankValue {
+	out := make([]IPRankValue, 0, len(m))
+	for k, v := range m {
+		if k == "" {
+			continue
+		}
+		out = append(out, IPRankValue{IP: k, Records: v[0], Bytes: v[1]})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Bytes != out[j].Bytes {
+			return out[i].Bytes > out[j].Bytes
+		}
+		return out[i].IP < out[j].IP
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// appRankingFromCounts maps an appid-string -> count map onto the ranking
+// payload, resolving ids through the app dictionary exactly like the scan path.
+func appRankingFromCounts(m map[string]int64) []CountValue {
+	out := make([]CountValue, 0, len(m))
+	for k, n := range m {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		name := AppNameOf(id)
+		if name == "" {
+			name = k
+		}
+		out = append(out, CountValue{Value: name, Count: n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Value < out[j].Value
+	})
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	return out
+}
+
 // OfficialStats computes compact aggregates for the official-style pages.
 // devices limits scope the same way Stats does. from/to are optional unix
 // seconds that further bound the window (0 = unset on that side); when
@@ -1076,6 +1453,21 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	}
 	hasWindow := from > 0 || to > 0
 
+	// Rollup-backed fast path. Only whole hours can come from agg_hour/agg_dim
+	// (they are keyed by hourBucket(ts)), so the partial hours at each edge
+	// still come from logs, and it is engaged only when the rollups are
+	// provably complete for those hours. An unready rollup silently leaves
+	// useRollup false and every panel below keeps its original scan query, so
+	// this can never change a number.
+	var rw rollupWindow
+	useRollup := false
+	if !cheap && hasWindow && from > 0 && to > 0 {
+		rw = splitRollupWindow(from, to)
+		if ok, err := s.rollupReady(rw); err == nil && ok {
+			useRollup = true
+		}
+	}
+
 	// cheap (no explicit window): aggregates are all bounded to the
 	// trailing hour via idx_logs_ts so the default 概况 call never touches
 	// the full table. Windowed calls aggregate over the caller's window.
@@ -1149,10 +1541,30 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	run("traffic", func(ctx context.Context) error {
 		var total int64
 		var bytesIn, bytesOut int64
-		if err := s.rdb.QueryRowContext(ctx,
-			"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+trafficBase,
-			trafficArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
-			return err
+		switch {
+		case useRollup:
+			var in, outB int64
+			var err error
+			total, in, outB, err = s.aggTotals(ctx, rw.fullFrom, rw.fullTo, scope, sargs)
+			if err != nil {
+				return err
+			}
+			bytesIn, bytesOut = in, outB
+			for _, p := range rw.rawParts() {
+				t, i, o, err := s.rawTotals(ctx, p[0], p[1], scope, sargs)
+				if err != nil {
+					return err
+				}
+				total += t
+				bytesIn += i
+				bytesOut += o
+			}
+		default:
+			if err := s.rdb.QueryRowContext(ctx,
+				"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs"+trafficBase,
+				trafficArgs...).Scan(&total, &bytesIn, &bytesOut); err != nil {
+				return err
+			}
 		}
 		out.Traffic.TotalRecords = total
 		out.Traffic.BytesIn = bytesIn
@@ -1178,6 +1590,14 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	// the heavy extras.
 	run("by_kind", func(ctx context.Context) error {
 		out.Traffic.ByKind = map[string]int64{}
+		if useRollup {
+			m, err := s.rollupHourCounts(ctx, rw, "kind", "idx_logs_ts_kind", scope, sargs)
+			if err != nil {
+				return err
+			}
+			out.Traffic.ByKind = m
+			return nil
+		}
 		rows, err := s.rdb.QueryContext(ctx, "SELECT kind, COUNT(*) FROM logs INDEXED BY idx_logs_ts_kind"+trafficBase+" GROUP BY kind", trafficArgs...)
 		if err != nil {
 			return err
@@ -1197,6 +1617,24 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	// by_device: a deployment registers only a handful of devices, so this
 	// GROUP BY stays cheap even when the window is large.
 	run("by_device", func(ctx context.Context) error {
+		if useRollup {
+			m, err := s.rollupHourCounts(ctx, rw, "device", "idx_logs_ts_device", scope, sargs)
+			if err != nil {
+				return err
+			}
+			// Match the scan query: empty devices are excluded and the list is
+			// capped at the top 100.
+			delete(m, "")
+			if len(m) > 100 {
+				top := topCounts(m, 100)
+				m = make(map[string]int64, len(top))
+				for _, v := range top {
+					m[v.Value] = v.Count
+				}
+			}
+			out.ByDevice = m
+			return nil
+		}
 		devWhere := trafficBase + " AND device != ''"
 		devArgs := append([]interface{}{}, trafficArgs...)
 		devRows, err := s.rdb.QueryContext(ctx,
@@ -1251,6 +1689,14 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			ipArgs = append(ipArgs, rankArgs...)
 		}
 		run("ip_ranking", func(ctx context.Context) error {
+			if useRollup {
+				m, err := s.rollupIPCounts(ctx, rw, scope, sargs)
+				if err != nil {
+					return err
+				}
+				out.IPRanking = topPairs(m, 20)
+				return nil
+			}
 			rows, err := s.rdb.QueryContext(ctx,
 				"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
 					" GROUP BY 1 ORDER BY 3 DESC LIMIT 20", ipArgs...)
@@ -1284,6 +1730,14 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			appArgs = append(appArgs, rankArgs...)
 		}
 		run("app_ranking", func(ctx context.Context) error {
+			if useRollup {
+				m, err := s.rollupDimCounts(ctx, rw, rollupDimAppid, "CAST(appid AS TEXT)", "idx_logs_ts_appid", " AND appid >= 0", scope, sargs)
+				if err != nil {
+					return err
+				}
+				out.AppRanking = appRankingFromCounts(m)
+				return nil
+			}
 			appRows, err := s.rdb.QueryContext(ctx,
 				"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
 			if err != nil {
@@ -1326,6 +1780,14 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 		}
 
 		run("top_domains", func(ctx context.Context) error {
+			if useRollup {
+				m, err := s.rollupDimCounts(ctx, rw, rollupDimDomain, "domain", "idx_logs_ts_domain", " AND domain != ''", scope, sargs)
+				if err != nil {
+					return err
+				}
+				out.TopDomains = topCounts(m, 10)
+				return nil
+			}
 			v, err := s.topValues(ctx, "domain", "idx_logs_ts_domain", 10, extraWhere, extraArgs)
 			if err != nil {
 				return err
@@ -1334,6 +1796,14 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			return nil
 		})
 		run("top_src_ip", func(ctx context.Context) error {
+			if useRollup {
+				m, err := s.rollupDimCounts(ctx, rw, rollupDimSrcIP, "src_ip", "idx_logs_ts_src", " AND src_ip != ''", scope, sargs)
+				if err != nil {
+					return err
+				}
+				out.TopSrcIP = topCounts(m, 10)
+				return nil
+			}
 			v, err := s.topValues(ctx, "src_ip", "idx_logs_ts_src", 10, extraWhere, extraArgs)
 			if err != nil {
 				return err
@@ -1535,11 +2005,242 @@ func (s *Store) ApplyRetention(retentionDays int) (int64, error) {
 			return err
 		}
 		n = m
+		// Prune the derived rollups with the same cutoff. Both tables are
+		// keyed by hour, so this drops whole expired buckets and keeps the
+		// rollups from outliving the rows they were derived from.
+		if _, err := tx.Exec("DELETE FROM agg_hour WHERE hour < ?", cutoff); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM agg_dim WHERE hour < ?", cutoff); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		return 0, err
 	}
 	return n, nil
+}
+
+/* ---------------- hourly rollups ---------------- */
+
+// rollupChunk bounds one rollup transaction. RollupTick may consume a much
+// larger budget per call, but it commits every chunk, so its write
+// transactions stay short and never hold the write mutex for long.
+const rollupChunk = 2000
+
+// rollupRow is the narrow projection the rollups need from logs. Selecting
+// only these columns keeps the backfill out of the wide parts of the table
+// (counters / extra / raw), which is what makes replaying 29M rows cheap.
+type rollupRow struct {
+	id       int64
+	ts       int64
+	device   string
+	kind     string
+	domain   string
+	srcIP    string
+	dstIP    string
+	appid    int
+	bytesIn  int64
+	bytesOut int64
+}
+
+// agg_dim dimension tags.
+const (
+	rollupDimDomain = "domain"
+	rollupDimSrcIP  = "src_ip"
+	rollupDimIP     = "ip"
+	rollupDimAppid  = "appid"
+)
+
+// hourBucket returns the hour a ts belongs to. It is the single definition
+// shared by the rollup writer and the rollup readers, and is the same
+// (ts/3600)*3600 rounding the raw trend query uses.
+func hourBucket(ts int64) int64 {
+	return (ts / 3600) * 3600
+}
+
+// rollupLastID reports the highest logs.id already folded into the rollups.
+func (s *Store) rollupLastID() (int64, error) {
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	var id int64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT last_id FROM rollup_state WHERE id = 1").Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// RollupLag reports how many newly inserted rows are not yet folded in
+// (0 = the rollups are current). The read path uses it to decide whether a
+// rollup-backed answer would be exact, and the worker logs it while backfilling.
+func (s *Store) RollupLag() (int64, error) {
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	// MAX(id) on an INTEGER PRIMARY KEY is a B-tree-maximum seek, not a scan.
+	var maxID int64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT COALESCE(MAX(id),0) FROM logs").Scan(&maxID); err != nil {
+		return 0, err
+	}
+	var lastID int64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT last_id FROM rollup_state WHERE id = 1").Scan(&lastID); err != nil {
+		return 0, err
+	}
+	if maxID <= lastID {
+		return 0, nil
+	}
+	return maxID - lastID, nil
+}
+
+// RollupTick folds at most budget newly inserted rows into the rollup tables
+// and returns how many it folded (0 = fully caught up).
+//
+// It deliberately runs OUTSIDE the ingest path: a plain read of logs on the
+// read-only pool plus short additive upserts on the write connection. The live
+// incident that shaped this package was a read query starving the ingest
+// writer, so the rollup never joins InsertBatch's transaction and can always
+// be backfilled or replayed later. Because rollup_state.last_id advances in the
+// same transaction as its upserts, an interrupted tick loses nothing and
+// replays (the aggregates are additive).
+func (s *Store) RollupTick(budget int) (int, error) {
+	if budget <= 0 {
+		budget = rollupChunk
+	}
+	lastID, err := s.rollupLastID()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for total < budget {
+		n := rollupChunk
+		if rem := budget - total; rem < n {
+			n = rem
+		}
+		rows, err := s.readRollupRows(lastID, n)
+		if err != nil {
+			return total, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		if err := s.applyRollup(rows); err != nil {
+			return total, err
+		}
+		lastID = rows[len(rows)-1].id
+		total += len(rows)
+	}
+	return total, nil
+}
+
+// readRollupRows reads the next `limit` rows after id `after`, ordered by id so
+// the rollup advances monotonically. ORDER BY id rides the primary key.
+func (s *Store) readRollupRows(after int64, limit int) ([]rollupRow, error) {
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx,
+		"SELECT id, ts, device, kind, domain, src_ip, dst_ip, appid, bytes_in, bytes_out FROM logs WHERE id > ? ORDER BY id LIMIT ?",
+		after, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]rollupRow, 0, limit)
+	for rows.Next() {
+		var r rollupRow
+		if err := rows.Scan(&r.id, &r.ts, &r.device, &r.kind, &r.domain, &r.srcIP, &r.dstIP, &r.appid, &r.bytesIn, &r.bytesOut); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// applyRollup folds one chunk into agg_hour/agg_dim and advances last_id, all
+// in a single transaction, so the recorded state can never drift from the
+// aggregates.
+func (s *Store) applyRollup(rows []rollupRow) error {
+	type hourKey struct {
+		hour   int64
+		device string
+		kind   string
+	}
+	type dimKey struct {
+		dim    string
+		device string
+		value  string
+		hour   int64
+	}
+	hours := make(map[hourKey][3]int64, len(rows))
+	dims := make(map[dimKey][2]int64, 4*len(rows))
+	for _, r := range rows {
+		h := hourBucket(r.ts)
+		hk := hourKey{h, r.device, r.kind}
+		v := hours[hk]
+		v[0]++
+		v[1] += r.bytesIn
+		v[2] += r.bytesOut
+		hours[hk] = v
+
+		bytes := r.bytesIn + r.bytesOut
+		addDim := func(dim, value string) {
+			if value == "" {
+				return
+			}
+			dk := dimKey{dim, r.device, value, h}
+			d := dims[dk]
+			d[0]++
+			d[1] += bytes
+			dims[dk] = d
+		}
+		addDim(rollupDimDomain, r.domain)
+		addDim(rollupDimSrcIP, r.srcIP)
+		// The IP ranking groups by COALESCE(NULLIF(src_ip,''), dst_ip) and
+		// skips rows where both are empty, so the rollup key is that
+		// expression verbatim.
+		if r.srcIP != "" {
+			addDim(rollupDimIP, r.srcIP)
+		} else {
+			addDim(rollupDimIP, r.dstIP)
+		}
+		// The app ranking counts appid >= 0 only (unknown is -1).
+		if r.appid >= 0 {
+			addDim(rollupDimAppid, strconv.Itoa(r.appid))
+		}
+	}
+	lastID := rows[len(rows)-1].id
+	return s.writeTx(func(tx *sql.Tx) error {
+		hs, err := tx.Prepare(`INSERT INTO agg_hour(hour, device, kind, n, bytes_in, bytes_out)
+			VALUES(?,?,?,?,?,?)
+			ON CONFLICT(hour, device, kind) DO UPDATE SET
+			  n = n + excluded.n,
+			  bytes_in = bytes_in + excluded.bytes_in,
+			  bytes_out = bytes_out + excluded.bytes_out`)
+		if err != nil {
+			return err
+		}
+		defer hs.Close()
+		for k, v := range hours {
+			if _, err := hs.Exec(k.hour, k.device, k.kind, v[0], v[1], v[2]); err != nil {
+				return err
+			}
+		}
+		ds, err := tx.Prepare(`INSERT INTO agg_dim(dim, device, value, hour, n, bytes)
+			VALUES(?,?,?,?,?,?)
+			ON CONFLICT(dim, device, value, hour) DO UPDATE SET
+			  n = n + excluded.n,
+			  bytes = bytes + excluded.bytes`)
+		if err != nil {
+			return err
+		}
+		defer ds.Close()
+		for k, v := range dims {
+			if _, err := ds.Exec(k.dim, k.device, k.value, k.hour, v[0], v[1]); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec("UPDATE rollup_state SET last_id = ?, updated_at = ? WHERE id = 1",
+			lastID, time.Now().Unix())
+		return err
+	})
 }
 
 /* ---------------- devices ---------------- */

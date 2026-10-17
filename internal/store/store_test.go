@@ -1,9 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1046,5 +1049,413 @@ func TestMigrateUserTFA(t *testing.T) {
 	u, _ = s.GetUserByUsername("olduser")
 	if !u.TFAEnabled || u.TFASecret != "SEKRET" {
 		t.Fatalf("secret not stored after migrate: %+v", u)
+	}
+}
+
+/* ---------------- hourly rollups ---------------- */
+
+// rollupFixture lays rows out over five consecutive hours with a deliberate
+// mix of every edge case the rollup predicates encode: a row with empty device
+// AND empty kind (still counted by totals/by_kind, excluded by by_device), an
+// empty domain, a row whose source IP is empty but destination is set (the
+// COALESCE key behind the IP ranking), appid -1 (unknown) alongside real ids,
+// and rows in both the interior and the trailing hours of the windows tested.
+func rollupFixture(h0 int64) []Entry {
+	e := func(off int64, dev, kind, src, dst, domain string, appid int, in, out int64) Entry {
+		return Entry{RecvTS: h0 + off, TS: h0 + off, Device: dev, Kind: kind,
+			SrcIP: src, DstIP: dst, Domain: domain, Appid: appid,
+			BytesIn: in, BytesOut: out}
+	}
+	return []Entry{
+		e(10, "a", "dnsquery", "10.0.0.1", "8.8.8.8", "a.com", -1, 100, 50),
+		e(20, "a", "dnsquery", "10.0.0.1", "8.8.8.8", "a.com", -1, 10, 5),
+		e(30, "a", "http", "10.0.0.2", "1.1.1.1", "", 714, 200, 100),
+		e(40, "b", "http", "", "9.9.9.9", "b.com", 714, 300, 150),
+		e(50, "", "", "", "", "", -1, 0, 0),
+		e(3600+10, "a", "dnsquery", "10.0.0.1", "8.8.8.8", "a.com", 714, 100, 0),
+		e(3600+20, "a", "session", "10.0.0.3", "10.0.0.1", "c.com", 23, 1000, 0),
+		e(7200+10, "b", "http", "10.0.0.2", "1.1.1.1", "b.com", 714, 500, 0),
+		e(10800+10, "a", "dnsquery", "10.0.0.1", "8.8.8.8", "a.com", -1, 7, 0),
+		// A fifth-hour row that none of the test windows cover: it exists so the
+		// rollup freshness frontier sits far enough ahead for them to qualify
+		// for the rollup-backed read path.
+		e(14400+10, "a", "http", "10.0.0.4", "10.0.0.5", "d.com", 1, 1, 1),
+	}
+}
+
+// drainRollup folds everything currently in logs into the rollups.
+func drainRollup(t *testing.T, s *Store) {
+	t.Helper()
+	for i := 0; i < 1000; i++ {
+		n, err := s.RollupTick(rollupChunk)
+		if err != nil {
+			t.Fatalf("rollup tick: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+	}
+	t.Fatal("rollup did not converge")
+}
+
+func scan3(t *testing.T, s *Store, q string, args ...interface{}) [3]int64 {
+	t.Helper()
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	var v [3]int64
+	if err := s.rdb.QueryRowContext(ctx, q, args...).Scan(&v[0], &v[1], &v[2]); err != nil {
+		t.Fatalf("query %q: %v", q, err)
+	}
+	return v
+}
+
+func scanMap(t *testing.T, s *Store, q string, args ...interface{}) map[string]int64 {
+	t.Helper()
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		t.Fatalf("query %q: %v", q, err)
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var k string
+		var n int64
+		if err := rows.Scan(&k, &n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out[k] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+func scanMap2(t *testing.T, s *Store, q string, args ...interface{}) map[string][2]int64 {
+	t.Helper()
+	ctx, cancel := s.readCtx()
+	defer cancel()
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
+	if err != nil {
+		t.Fatalf("query %q: %v", q, err)
+	}
+	defer rows.Close()
+	out := map[string][2]int64{}
+	for rows.Next() {
+		var k string
+		var a, b int64
+		if err := rows.Scan(&k, &a, &b); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out[k] = [2]int64{a, b}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+// TestRollupMatchesRaw is the contract that lets the read path swap a raw
+// aggregate for a rollup aggregate: for hour-aligned windows the rollup tables
+// must reproduce the raw query EXACTLY — same totals, same byte sums, same top
+// value counts, including the empty-device / empty-kind / empty-value and
+// appid >= 0 / COALESCE-IP edge cases.
+func TestRollupMatchesRaw(t *testing.T) {
+	s := openTest(t)
+	h0 := hourBucket(1700000000)
+	if err := s.InsertBatch(rollupFixture(h0)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	drainRollup(t, s)
+	if lag, err := s.RollupLag(); err != nil || lag != 0 {
+		t.Fatalf("lag=%d err=%v, want 0", lag, err)
+	}
+	if n := scanMap(t, s, "SELECT value, SUM(n) FROM agg_dim WHERE value = '' GROUP BY 1"); len(n) != 0 {
+		t.Errorf("agg_dim must not carry empty values: %v", n)
+	}
+
+	windows := []struct {
+		name     string
+		from, to int64
+	}{
+		{"three-hours", h0, h0 + 3*3600 - 1},
+		{"first-hour", h0, h0 + 3600 - 1},
+		{"last-two-hours", h0 + 3600, h0 + 3*3600 - 1},
+	}
+	for _, w := range windows {
+		t.Run(w.name, func(t *testing.T) {
+			rawTotals := scan3(t, s,
+				"SELECT COUNT(*), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM logs WHERE ts >= ? AND ts <= ?",
+				w.from, w.to)
+			aggTotals := scan3(t, s,
+				"SELECT COALESCE(SUM(n),0), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM agg_hour WHERE hour >= ? AND hour <= ?",
+				w.from, w.to)
+			if rawTotals != aggTotals {
+				t.Errorf("totals: raw=%v rollup=%v", rawTotals, aggTotals)
+			}
+
+			for _, c := range []struct {
+				name      string
+				raw, aggr string
+			}{
+				{
+					"by_kind",
+					"SELECT kind, COUNT(*) FROM logs WHERE ts >= ? AND ts <= ? GROUP BY 1",
+					"SELECT kind, SUM(n) FROM agg_hour WHERE hour >= ? AND hour <= ? GROUP BY 1",
+				},
+				{
+					"by_device",
+					"SELECT device, COUNT(*) FROM logs WHERE ts >= ? AND ts <= ? AND device != '' GROUP BY 1",
+					"SELECT device, SUM(n) FROM agg_hour WHERE hour >= ? AND hour <= ? AND device != '' GROUP BY 1",
+				},
+				{
+					"top_domain",
+					"SELECT domain, COUNT(*) FROM logs WHERE ts >= ? AND ts <= ? AND domain != '' GROUP BY 1",
+					"SELECT value, SUM(n) FROM agg_dim WHERE dim = 'domain' AND hour >= ? AND hour <= ? GROUP BY 1",
+				},
+				{
+					"top_src_ip",
+					"SELECT src_ip, COUNT(*) FROM logs WHERE ts >= ? AND ts <= ? AND src_ip != '' GROUP BY 1",
+					"SELECT value, SUM(n) FROM agg_dim WHERE dim = 'src_ip' AND hour >= ? AND hour <= ? GROUP BY 1",
+				},
+				{
+					"app_ranking",
+					"SELECT CAST(appid AS TEXT), COUNT(*) FROM logs WHERE ts >= ? AND ts <= ? AND appid >= 0 GROUP BY 1",
+					"SELECT value, SUM(n) FROM agg_dim WHERE dim = 'appid' AND hour >= ? AND hour <= ? GROUP BY 1",
+				},
+			} {
+				raw := scanMap(t, s, c.raw, w.from, w.to)
+				agg := scanMap(t, s, c.aggr, w.from, w.to)
+				if !reflect.DeepEqual(raw, agg) {
+					t.Errorf("%s: raw=%v rollup=%v", c.name, raw, agg)
+				}
+			}
+
+			// The IP ranking carries a record count AND a byte sum keyed by the
+			// COALESCE expression, so it compares as a pair map.
+			rawIP := scanMap2(t, s,
+				"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in+bytes_out),0) FROM logs WHERE ts >= ? AND ts <= ? AND (src_ip != '' OR dst_ip != '') GROUP BY 1",
+				w.from, w.to)
+			aggIP := scanMap2(t, s,
+				"SELECT value, SUM(n), SUM(bytes) FROM agg_dim WHERE dim = 'ip' AND hour >= ? AND hour <= ? GROUP BY 1",
+				w.from, w.to)
+			if !reflect.DeepEqual(rawIP, aggIP) {
+				t.Errorf("ip_ranking: raw=%v rollup=%v", rawIP, aggIP)
+			}
+		})
+	}
+}
+
+// TestRollupIncrementalAndIdempotent locks the crash-replay property: folding
+// with nothing new changes nothing, and a later batch is added incrementally.
+func TestRollupIncrementalAndIdempotent(t *testing.T) {
+	s := openTest(t)
+	h1 := hourBucket(1700000000)
+	if err := s.InsertBatch([]Entry{
+		{RecvTS: h1 + 10, TS: h1 + 10, Device: "a", Kind: "http",
+			SrcIP: "10.0.0.1", Domain: "a.com", Appid: 1, BytesIn: 5, BytesOut: 5},
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	drainRollup(t, s)
+	sel := "SELECT COALESCE(SUM(n),0), COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM agg_hour WHERE hour = ?"
+	before := scan3(t, s, sel, h1)
+
+	// replaying with no new rows must be a no-op
+	if n, err := s.RollupTick(rollupChunk); err != nil || n != 0 {
+		t.Fatalf("second tick folded=%d err=%v, want 0", n, err)
+	}
+	if after := scan3(t, s, sel, h1); after != before {
+		t.Fatalf("rollup changed on replay: %v -> %v", before, after)
+	}
+
+	if err := s.InsertBatch([]Entry{
+		{RecvTS: h1 + 20, TS: h1 + 20, Device: "a", Kind: "http",
+			SrcIP: "10.0.0.2", Domain: "b.com", Appid: 1, BytesIn: 7, BytesOut: 3},
+	}); err != nil {
+		t.Fatalf("insert 2: %v", err)
+	}
+	if lag, err := s.RollupLag(); err != nil || lag != 1 {
+		t.Fatalf("lag=%d err=%v, want 1", lag, err)
+	}
+	drainRollup(t, s)
+	want := [3]int64{before[0] + 1, before[1] + 7, before[2] + 3}
+	if after := scan3(t, s, sel, h1); after != want {
+		t.Fatalf("incremental fold: got %v want %v", after, want)
+	}
+}
+
+// TestRollupRetentionPrunesAggregates keeps the derived tables from outliving
+// their source rows: otherwise a long window would report rows retention
+// already deleted.
+func TestRollupRetentionPrunesAggregates(t *testing.T) {
+	s := openTest(t)
+	h0 := hourBucket(1700000000) // far in the past
+	if err := s.InsertBatch(rollupFixture(h0)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	drainRollup(t, s)
+	if n := scanMap(t, s, "SELECT dim, SUM(n) FROM agg_dim GROUP BY 1"); len(n) == 0 {
+		t.Fatal("expected agg_dim rows before retention")
+	}
+	if _, err := s.ApplyRetention(1); err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if got := scan3(t, s, "SELECT COUNT(*), 0, 0 FROM agg_hour")[0]; got != 0 {
+		t.Errorf("agg_hour rows left after retention: %d", got)
+	}
+	if got := scan3(t, s, "SELECT COUNT(*), 0, 0 FROM agg_dim")[0]; got != 0 {
+		t.Errorf("agg_dim rows left after retention: %d", got)
+	}
+}
+
+// TestSplitRollupWindow locks the boundary arithmetic. The parts must never
+// overlap and must tile the requested window exactly whether the edges land on
+// an hour boundary or mid-hour: an off-by-one here would shift rows between the
+// rollup and the scan path and silently change the reported totals.
+func TestSplitRollupWindow(t *testing.T) {
+	h := hourBucket(1700000000)
+	none := [2]int64{0, -1}
+	cases := []struct {
+		name     string
+		from, to int64
+		head     [2]int64
+		full     [2]int64
+		tail     [2]int64
+	}{
+		{"aligned-one-hour", h, h + 3599, none, [2]int64{h, h + 3599}, none},
+		{"aligned-three-hours", h, h + 3*3600 - 1, none, [2]int64{h, h + 3*3600 - 1}, none},
+		{"mid-head-aligned-tail", h + 10, h + 2*3600 - 1,
+			[2]int64{h + 10, h + 3599}, [2]int64{h + 3600, h + 2*3600 - 1}, none},
+		{"aligned-head-mid-tail", h, h + 3600 + 10,
+			none, [2]int64{h, h + 3599}, [2]int64{h + 3600, h + 3610}},
+		{"mid-head-mid-tail", h + 617, h + 2*3600 + 1234,
+			[2]int64{h + 617, h + 3599}, [2]int64{h + 3600, h + 2*3600 - 1}, [2]int64{h + 7200, h + 8434}},
+		{"inside-one-hour", h + 10, h + 20, [2]int64{h + 10, h + 20}, none, none},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := splitRollupWindow(c.from, c.to)
+			got := [3][2]int64{
+				partSpan(w.hasHead, w.headFrom, w.headTo),
+				partSpan(w.hasFull, w.fullFrom, w.fullTo+3599),
+				partSpan(w.hasTail, w.tailFrom, w.tailTo),
+			}
+			want := [3][2]int64{c.head, c.full, c.tail}
+			if got != want {
+				t.Fatalf("split %d-%d = head%v full%v tail%v, want head%v full%v tail%v",
+					c.from, c.to, got[0], got[1], got[2], want[0], want[1], want[2])
+			}
+			assertTiles(t, c.from, c.to, got)
+		})
+	}
+	// Degenerate inputs must yield no parts at all rather than a bogus window.
+	for _, c := range [][2]int64{{0, 100}, {100, 0}, {200, 100}} {
+		if w := splitRollupWindow(c[0], c[1]); w.hasHead || w.hasFull || w.hasTail {
+			t.Errorf("split %d-%d should be empty, got %+v", c[0], c[1], w)
+		}
+	}
+}
+
+func partSpan(ok bool, from, to int64) [2]int64 {
+	if !ok {
+		return [2]int64{0, -1}
+	}
+	return [2]int64{from, to}
+}
+
+// assertTiles checks that spans (head, full, tail in that order) cover
+// [from,to] with neither a gap nor an overlap.
+func assertTiles(t *testing.T, from, to int64, spans [3][2]int64) {
+	t.Helper()
+	cur := from
+	for _, s := range spans {
+		if s[1] < s[0] {
+			continue
+		}
+		if s[0] != cur {
+			t.Fatalf("gap/overlap at %d: span %v", cur, s)
+		}
+		cur = s[1] + 1
+	}
+	if cur != to+1 {
+		t.Fatalf("coverage ends at %d, want %d", cur-1, to)
+	}
+}
+
+// TestOfficialStatsRollupMatchesRaw drives the whole read path twice over the
+// same rows: once before the rollups exist (every panel on its original scan
+// query) and once after they are folded (whole hours from agg_hour/agg_dim plus
+// the partial edge hours from logs). The payloads must be byte-identical. The
+// request windows are deliberately not hour-aligned - that is the trap this
+// covers, because an hour bucket cannot answer an arbitrary second-granularity
+// window on its own.
+func TestOfficialStatsRollupMatchesRaw(t *testing.T) {
+	h0 := hourBucket(1700000000) // far in the past, so retention never bites
+	windows := []struct {
+		name     string
+		from, to int64
+	}{
+		{"head+full+tail", h0 + 617, h0 + 2*3600 + 1234},
+		{"head+full", h0 + 617, h0 + 3*3600 - 1},
+		// Starts on an hour boundary above the rollup floor: the window must not
+		// begin at the oldest folded hour, which retention can only partially
+		// prune (see rollupHourFloor).
+		{"full+tail", h0 + 3600, h0 + 2*3600 + 1234},
+	}
+	for _, win := range windows {
+		t.Run(win.name, func(t *testing.T) {
+			s := openTest(t)
+			if err := s.InsertBatch(rollupFixture(h0)); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			// Pass 1: rollups are empty, so the path falls back to logs.
+			raw, err := s.OfficialStats(Counters{}, nil, win.from, win.to, true, true, false)
+			if err != nil {
+				t.Fatalf("raw pass: %v", err)
+			}
+			if len(raw.Warnings) != 0 {
+				t.Fatalf("raw pass warnings: %v", raw.Warnings)
+			}
+			drainRollup(t, s)
+			// Pass 2: only valid if the rollups are provably complete for the
+			// window's whole hours - otherwise this test would prove nothing.
+			rw := splitRollupWindow(win.from, win.to)
+			if !rw.hasFull {
+				t.Fatalf("window %d-%d has no whole hour; test would be vacuous", win.from, win.to)
+			}
+			if ok, err := s.rollupReady(rw); err != nil || !ok {
+				t.Fatalf("rollups not ready for %d-%d: ok=%v err=%v", win.from, win.to, ok, err)
+			}
+			agg, err := s.OfficialStats(Counters{}, nil, win.from, win.to, true, true, false)
+			if err != nil {
+				t.Fatalf("rollup pass: %v", err)
+			}
+			if len(agg.Warnings) != 0 {
+				t.Fatalf("rollup pass warnings: %v", agg.Warnings)
+			}
+			compareOfficialStats(t, raw, agg)
+		})
+	}
+}
+
+// compareOfficialStats fails unless both payloads serialise identically. JSON
+// is a fair referee here: maps serialise with sorted keys and the ranked slices
+// keep their order, so any difference in a count, a byte figure or a ranking
+// order shows up.
+func compareOfficialStats(t *testing.T, raw, agg *OfficialStats) {
+	t.Helper()
+	rb, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	ab, err := json.Marshal(agg)
+	if err != nil {
+		t.Fatalf("marshal rollup: %v", err)
+	}
+	if !bytes.Equal(rb, ab) {
+		t.Fatalf("rollup payload differs from raw:\n raw=%s\nrollup=%s", rb, ab)
 	}
 }
