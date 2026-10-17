@@ -418,24 +418,25 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 	}
 	full := parseBoolParam(q.Get("full"))
 	rank := parseBoolParam(q.Get("rank")) || full // full deep-dive implies rankings
-	// The cache only applies to the default bare call (no window, no rank,
-	// no full) that the 系统概况 auto-refresh keeps re-issuing; everything
-	// else is computed fresh so custom ranges never serve stale data.
-	bareDefault := from == 0 && to == 0 && !rank && !full
-	if bareDefault {
-		if body, ok := s.cacheGet("official", scope, officialCacheTTL); ok {
-			writeJSON(w, http.StatusOK, body)
-			return
-		}
+	// cheap is the index-bounded aggregate set: the default bare call the
+	// 系统概况 auto-refresh keeps re-issuing (no window, no rank, no full).
+	cheap := from == 0 && to == 0 && !rank && !full
+	// Memoize every parameter combination, not just the bare default. A
+	// windowed call runs 8 aggregates over up to 24h of a 12GB table (~25s
+	// warm), and the UI re-issues the same URL on every 10s auto-refresh;
+	// without this each tick recomputes the whole set and they pile up. The
+	// key carries from/to/full/rank so distinct ranges never collide.
+	ckey := fmt.Sprintf("official:%d:%d:%t:%t", from, to, full, rank)
+	if body, ok := s.cacheGet(ckey, scope, officialCacheTTL); ok {
+		writeJSON(w, http.StatusOK, body)
+		return
 	}
-	off, err := s.Store.OfficialStats(s.counters(), scope, from, to, full, rank, bareDefault)
+	off, err := s.Store.OfficialStats(s.counters(), scope, from, to, full, rank, cheap)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if bareDefault {
-		s.cacheSet("official", scope, off)
-	}
+	s.cacheSet(ckey, scope, off)
 	writeJSON(w, http.StatusOK, off)
 }
 /* ---------------- short-TTL stats cache ---------------- */
@@ -446,11 +447,10 @@ func (s *Server) handleOfficialStats(w http.ResponseWriter, r *http.Request) {
 
 const statsCacheTTL = 30 * time.Second
 
-// officialCacheTTL memoizes the bare (cheap) 系统概况 call. The UI
-// auto-refreshes every 10 s, but the 30 s TTL is long enough that the
-// expensive underlying aggregates only re-run occasionally while the
-// page stays responsive; every other combination (rank / full /
-// explicit window) is always computed fresh.
+// officialCacheTTL memoizes 系统概况 / 流量分析 responses, keyed by
+// scope+window+full+rank. The UI auto-refreshes every 10 s; the 30 s TTL is
+// long enough that the expensive aggregates (a 24h windowed deep-dive runs
+// ~25 s warm) only re-run occasionally while the page stays responsive.
 const officialCacheTTL = 30 * time.Second
 
 type statsCacheEntry struct {

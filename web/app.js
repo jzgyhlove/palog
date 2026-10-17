@@ -592,7 +592,30 @@ function recentRow(item) {
     '</tr>';
 }
 
+// 后端在时间窗过大、聚合预算耗尽时会放弃部分面板,并把它们的名字放进
+// warnings(响应仍为 200,其余面板照常返回)。这里把缺失项提示出来,免得
+// 用户把「超时未算」误当成「没有数据」。
+const PANEL_CN = {
+  traffic: '流量汇总', by_kind: '日志类型分布', by_device: '设备分布',
+  ip_ranking: 'IP 排名', app_ranking: '应用排名', top_domains: 'Top 域名',
+  top_src_ip: 'Top 源 IP', recent: '最近记录',
+};
+function noteWarnings(o) {
+  if (!o || !o.warnings || !o.warnings.length) return;
+  toast('部分统计项超时未完成: ' + o.warnings.map(w => PANEL_CN[w] || w).join('、'), false);
+}
+
+let dashBusy = false;
 async function refreshDash() {
+  // A windowed deep-dive aggregates up to 24h of a multi-GB table and takes
+  // tens of seconds (longer on a cold cache). Refuse to start a second run
+  // while one is in flight so the 10s auto-refresh timer cannot pile heavy
+  // queries behind each other; the server memoizes results for 30s, so
+  // repeats are cheap once the first run completes.
+  if (dashBusy) return;
+  dashBusy = true;
+  const loading = $('d-loading');
+  if (loading) loading.style.display = 'inline-block';
   try {
     const dev = $('d-device').value;
     const from = fromDTLocal($('d-from').value) || 0;
@@ -612,6 +635,7 @@ async function refreshDash() {
       // 24h 趋势图：/api/stats 仅计算 24 个小时桶 + 尾小时计数，成本可控。
       api('/api/stats' + (dev ? '?device=' + encodeURIComponent(dev) : '')),
     ]);
+    noteWarnings(o);
     $('s-pps').innerHTML = (h.packets && h.uptime_sec ? (h.packets / h.uptime_sec).toFixed(2) : '0') + ' <small>包/秒</small>';
     $('s-pkts').innerHTML = fmtNum(h.packets) + ' / ' + fmtNum(h.records);
     $('s-errs').textContent = fmtNum(h.parse_errors);
@@ -636,6 +660,9 @@ async function refreshDash() {
     $('ov-sec-hour').textContent = fmtNum(o.security.last_hour);
   } catch (err) {
     if (err.message !== 'unauthorized') toast('系统概况加载失败: ' + err.message, true);
+  } finally {
+    dashBusy = false;
+    if (loading) loading.style.display = 'none';
   }
 }
 
@@ -1154,6 +1181,7 @@ async function refreshAnalysis() {
   p.set('rank', '1');
   try {
     const o = await api('/api/official-stats?' + p.toString());
+    noteWarnings(o);
     if (anSubState.sub === 'iprank') {
       renderIpRanking(o.ip_ranking || []);
     }

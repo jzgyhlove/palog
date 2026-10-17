@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -817,6 +819,59 @@ func TestOfficialStats(t *testing.T) {
 	if scoped.Traffic.TotalRecords != 1 || scoped.ByDevice["fw-1"] != 1 {
 		t.Fatalf("scoped default: total=%d by_device=%v",
 			scoped.Traffic.TotalRecords, scoped.ByDevice)
+	}
+}
+
+// TestOfficialStatsConcurrent drives the fan-out path from several goroutines
+// at once. OfficialStats now runs its independent aggregates on their own
+// goroutines behind a lane semaphore sized to the read pool, so a bug there
+// (a lane leaked, or a goroutine waiting on a connection it already holds)
+// would deadlock the whole call instead of failing loudly — hence the
+// explicit timeout. Run under -race where available to also catch any
+// cross-goroutine write to a shared field of the result.
+func TestOfficialStatsConcurrent(t *testing.T) {
+	s := openTest(t)
+	if err := s.InsertBatch(devEntries()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// full+rank+window schedules every aggregate goroutine, so the
+			// lane semaphore is fully exercised.
+			o, err := s.OfficialStats(Counters{ParseErrors: 1}, nil, now-3600, now, true, true, false)
+			if err != nil {
+				errs <- fmt.Errorf("official stats: %w", err)
+				return
+			}
+			switch {
+			case o.Traffic.TotalRecords != 2:
+				errs <- fmt.Errorf("total=%d, want 2", o.Traffic.TotalRecords)
+			case len(o.Recent) != 2:
+				errs <- fmt.Errorf("recent=%d, want 2", len(o.Recent))
+			case o.ByDevice["fw-1"] != 1 || o.ByDevice["fw-2"] != 1:
+				errs <- fmt.Errorf("by_device=%v", o.ByDevice)
+			case o.Security.LastHour != 2:
+				errs <- fmt.Errorf("security last hour=%d, want 2", o.Security.LastHour)
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("OfficialStats fan-out deadlocked (lane or read-pool leak)")
+	}
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

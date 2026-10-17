@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -97,6 +98,11 @@ type OfficialStats struct {
 	TopSrcIP   []CountValue     `json:"top_src_ip"`
 	ByDevice   map[string]int64 `json:"by_device"`
 	Recent     []Entry          `json:"recent"`
+	// Warnings names the aggregate panels that could not be computed in time
+	// (an oversized window whose scan exceeds aggBudget). The response is
+	// still 200 with every panel that did complete, so a heavy range degrades
+	// to a partial dashboard instead of failing outright.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type IPRankValue struct {
@@ -584,11 +590,32 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// readCtx bounds one read query. Reads run on the dedicated read pool, so
-// this protects the caller (and the WAL snapshot the read holds) from an
+// aggTimeout bounds a single aggregate query on the heavy 系统概况 /
+// 流量分析 path (an explicit from/to window, ?full=1 or ?rank=1). It is far
+// larger than qTimeout because these aggregates legitimately run for seconds
+// on a multi-GB table — a cold 24h Top-src-IP measures ~27s — and each
+// aggregate now gets its own deadline (see OfficialStats) instead of sharing
+// one budget with its siblings.
+const aggTimeout = 60 * time.Second
+
+// aggBudget bounds the whole heavy fan-out (one 系统概况 / 流量分析 response).
+// The aggregates run in parallel waves on the read pool, so without a wall
+// budget a window far larger than the page cache can hold would keep every
+// lane busy for two or more 60s rounds. Panels that miss the budget are
+// named in OfficialStats.Warnings and the response still returns 200 with the
+// rest, so an oversized range degrades instead of failing.
+const aggBudget = 60 * time.Second
+
+// readCtxT bounds one read query to d. Reads run on the dedicated read pool,
+// so this protects the caller (and the WAL snapshot the read holds) from an
 // unbounded plan without ever touching the write connection.
+func (s *Store) readCtxT(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
+// readCtx bounds one interactive read query to the Store's qTimeout.
 func (s *Store) readCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), s.qTimeout)
+	return s.readCtxT(s.qTimeout)
 }
 
 // writeTx runs fn holding the write mutex, inside one transaction on a
@@ -916,7 +943,7 @@ func (s *Store) Stats(c Counters, uptime time.Duration, devices []string) (*Stat
 // composite index to force: left to itself the planner scans the whole
 // single-column index and ignores the ts bound (the live incident's
 // multi-minute GROUP BYs).
-func (s *Store) topValues(col, indexBy string, n int, where string, args []interface{}) ([]CountValue, error) {
+func (s *Store) topValues(ctx context.Context, col, indexBy string, n int, where string, args []interface{}) ([]CountValue, error) {
 	// col and indexBy are internal constants, never user input.
 	// Append col != '' filter to the provided where clause.
 	fullWhere := where
@@ -927,8 +954,6 @@ func (s *Store) topValues(col, indexBy string, n int, where string, args []inter
 	}
 	fullArgs := append([]interface{}{}, args...)
 	fullArgs = append(fullArgs, n)
-	ctx, cancel := s.readCtx()
-	defer cancel()
 	rows, err := s.rdb.QueryContext(ctx,
 		"SELECT "+col+", COUNT(*) AS c FROM logs INDEXED BY "+indexBy+fullWhere+" GROUP BY "+col+" ORDER BY c DESC, "+col+" ASC LIMIT ?", fullArgs...)
 	if err != nil {
@@ -965,14 +990,78 @@ func (s *Store) topValues(col, indexBy string, n int, where string, args []inter
 //     bounded to the window, or to the trailing hour when no window is
 //     given. (Top domains / src IP, by_kind and by_device are already in
 //     the cheap set and therefore always present.)
+//
+// The independent aggregates run concurrently (bounded by the read pool),
+// each with its own deadline; a panel that cannot finish within aggBudget is
+// skipped and named in Warnings instead of failing the call, so an oversized
+// window degrades to a partial dashboard rather than returning an error.
 func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full, rank, cheap bool) (*OfficialStats, error) {
 	out := &OfficialStats{}
 	out.Security.ParseErrors = c.ParseErrors
 
 	scope, sargs := scopeCond(devices)
 
-	ctx, cancel := s.readCtx()
-	defer cancel()
+	// The aggregates below are independent, so each runs on its own goroutine
+	// with its own deadline (qd) instead of sharing one context. They used to
+	// share a single s.qTimeout (15s) context, so their combined runtime
+	// (~25s warm / ~70s cold on a 12GB table) always blew the budget and every
+	// windowed/full call failed with "context deadline exceeded" even though
+	// no individual query came close to the limit. lanes caps the readers in
+	// flight to the read-pool size so a heavy 概况 call cannot starve the
+	// other read endpoints.
+	qd := s.qTimeout
+	var budgetEnd time.Time
+	if !cheap {
+		qd = aggTimeout
+		budgetEnd = time.Now().Add(aggBudget)
+	}
+	lanes := make(chan struct{}, 4)
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		fail error
+	)
+	// run schedules one aggregate panel. Its deadline is its own (qd), capped
+	// by whatever remains of the overall budget. A panel that runs out of time
+	// is recorded in Warnings rather than failing the whole response; any
+	// other error stays fatal, so a real SQL failure is never masked as an
+	// empty panel.
+	run := func(panel string, fn func(context.Context) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lanes <- struct{}{}
+			defer func() { <-lanes }()
+			d := qd
+			if !budgetEnd.IsZero() {
+				rem := time.Until(budgetEnd)
+				if rem <= 0 {
+					mu.Lock()
+					out.Warnings = append(out.Warnings, panel)
+					mu.Unlock()
+					return
+				}
+				if rem < d {
+					d = rem
+				}
+			}
+			ctx, cancel := s.readCtxT(d)
+			defer cancel()
+			if err := fn(ctx); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					mu.Lock()
+					out.Warnings = append(out.Warnings, panel)
+					mu.Unlock()
+					return
+				}
+				mu.Lock()
+				if fail == nil {
+					fail = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
 
 	// timeCond + timeArgs: the caller-provided ts window.
 	var timeCond string
@@ -1054,7 +1143,10 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			trafficArgs = append(append([]interface{}{}, trafficArgs...), cutoff)
 		}
 	}
-	traffic := func() error {
+	// traffic totals + last-hour count. security.LastHour is the same
+	// trailing-hour (or window) count, so it is derived here rather than in
+	// a second goroutine that would have to read this goroutine's result.
+	run("traffic", func(ctx context.Context) error {
 		var total int64
 		var bytesIn, bytesOut int64
 		if err := s.rdb.QueryRowContext(ctx,
@@ -1068,17 +1160,23 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 
 		if hasWindow {
 			out.Traffic.LastHour = total
+			out.Security.LastHour = total
 		} else {
 			if err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Traffic.LastHour); err != nil {
 				return err
 			}
+			if out.Security.LastHour == 0 {
+				out.Security.LastHour = out.Traffic.LastHour
+			}
 		}
+		return nil
+	})
 
-		// by_kind / by_device: tiny GROUP BYs — the kind column holds a
-		// handful of values and a deployment registers only a handful of
-		// devices, so both stay cheap even when the window is large.
-		// Computed on every path (including cheap) so the 系统概况 1h
-		// view shows 日志类型分布 and 设备分布 without the heavy extras.
+	// by_kind: tiny GROUP BY — the kind column holds a handful of values, so
+	// it stays cheap even when the window is large. Computed on every path
+	// (including cheap) so the 系统概况 1h view shows 日志类型分布 without
+	// the heavy extras.
+	run("by_kind", func(ctx context.Context) error {
 		out.Traffic.ByKind = map[string]int64{}
 		rows, err := s.rdb.QueryContext(ctx, "SELECT kind, COUNT(*) FROM logs INDEXED BY idx_logs_ts_kind"+trafficBase+" GROUP BY kind", trafficArgs...)
 		if err != nil {
@@ -1093,45 +1191,34 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			}
 			out.Traffic.ByKind[k] = n
 		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		devWhere := trafficBase
+		return rows.Err()
+	})
+
+	// by_device: a deployment registers only a handful of devices, so this
+	// GROUP BY stays cheap even when the window is large.
+	run("by_device", func(ctx context.Context) error {
+		devWhere := trafficBase + " AND device != ''"
 		devArgs := append([]interface{}{}, trafficArgs...)
-		devWhere += " AND device != ''"
 		devRows, err := s.rdb.QueryContext(ctx,
 			"SELECT device, COUNT(*) FROM logs INDEXED BY idx_logs_ts_device"+devWhere+
 				" GROUP BY device ORDER BY 2 DESC LIMIT 100", devArgs...)
 		if err != nil {
 			return err
 		}
+		defer devRows.Close()
 		out.ByDevice = map[string]int64{}
 		for devRows.Next() {
 			var d string
 			var n int64
 			if err := devRows.Scan(&d, &n); err != nil {
-				devRows.Close()
 				return err
 			}
 			if d != "" {
 				out.ByDevice[d] = n
 			}
 		}
-		devRows.Close()
 		return devRows.Err()
-	}
-	if err := traffic(); err != nil {
-		return nil, err
-	}
-
-	// security last hour
-	if hasWindow {
-		out.Security.LastHour = out.Traffic.TotalRecords
-	} else if out.Security.LastHour == 0 {
-		if err := s.rdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+lastHourWhere, lastHourArgs...).Scan(&out.Security.LastHour); err != nil {
-			return nil, err
-		}
-	}
+	})
 
 	// IP/app rankings: the primary payload of 流量分析 (explicit from/to
 	// windows, rank=true). Bounded by their LIMIT 20 caps; the bare
@@ -1163,26 +1250,26 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			ipWhere += rankCond
 			ipArgs = append(ipArgs, rankArgs...)
 		}
-		rows, err := s.rdb.QueryContext(ctx,
-			"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
-				" GROUP BY 1 ORDER BY 3 DESC LIMIT 20", ipArgs...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var v IPRankValue
-			if err := rows.Scan(&v.IP, &v.Records, &v.Bytes); err != nil {
-				return nil, err
+		run("ip_ranking", func(ctx context.Context) error {
+			rows, err := s.rdb.QueryContext(ctx,
+				"SELECT COALESCE(NULLIF(src_ip,''), dst_ip), COUNT(*), COALESCE(SUM(bytes_in + bytes_out),0) FROM logs"+ipWhere+
+					" GROUP BY 1 ORDER BY 3 DESC LIMIT 20", ipArgs...)
+			if err != nil {
+				return err
 			}
-			if v.IP == "" {
-				continue
+			defer rows.Close()
+			for rows.Next() {
+				var v IPRankValue
+				if err := rows.Scan(&v.IP, &v.Records, &v.Bytes); err != nil {
+					return err
+				}
+				if v.IP == "" {
+					continue
+				}
+				out.IPRanking = append(out.IPRanking, v)
 			}
-			out.IPRanking = append(out.IPRanking, v)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+			return rows.Err()
+		})
 
 		// App ranking by appid count, excluding unknown (-1). Served by
 		// idx_logs_ts_appid over the window.
@@ -1196,30 +1283,30 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			appWhere += rankCond
 			appArgs = append(appArgs, rankArgs...)
 		}
-		appRows, err := s.rdb.QueryContext(ctx,
-			"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
-		if err != nil {
-			return nil, err
-		}
-		defer appRows.Close()
-		for appRows.Next() {
-			var appid int
-			var n int64
-			if err := appRows.Scan(&appid, &n); err != nil {
-				return nil, err
+		run("app_ranking", func(ctx context.Context) error {
+			appRows, err := s.rdb.QueryContext(ctx,
+				"SELECT appid, COUNT(*) FROM logs"+appWhere+" GROUP BY appid ORDER BY COUNT(*) DESC LIMIT 20", appArgs...)
+			if err != nil {
+				return err
 			}
-			name := AppNameOf(appid)
-			if name == "" {
-				name = strconv.Itoa(appid)
+			defer appRows.Close()
+			for appRows.Next() {
+				var appid int
+				var n int64
+				if err := appRows.Scan(&appid, &n); err != nil {
+					return err
+				}
+				name := AppNameOf(appid)
+				if name == "" {
+					name = strconv.Itoa(appid)
+				}
+				out.AppRanking = append(out.AppRanking, CountValue{
+					Value: name,
+					Count: n,
+				})
 			}
-			out.AppRanking = append(out.AppRanking, CountValue{
-				Value: name,
-				Count: n,
-			})
-		}
-		if err := appRows.Err(); err != nil {
-			return nil, err
-		}
+			return appRows.Err()
+		})
 	}
 
 	// ---- overview extras ----
@@ -1238,40 +1325,50 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 			extraArgs = append(extraArgs, time.Now().Unix()-3600)
 		}
 
-		// Top domains
-		var err error
-		if out.TopDomains, err = s.topValues("domain", "idx_logs_ts_domain", 10, extraWhere, extraArgs); err != nil {
-			return nil, err
-		}
-		// Top source IPs
-		if out.TopSrcIP, err = s.topValues("src_ip", "idx_logs_ts_src", 10, extraWhere, extraArgs); err != nil {
-			return nil, err
-		}
+		run("top_domains", func(ctx context.Context) error {
+			v, err := s.topValues(ctx, "domain", "idx_logs_ts_domain", 10, extraWhere, extraArgs)
+			if err != nil {
+				return err
+			}
+			out.TopDomains = v
+			return nil
+		})
+		run("top_src_ip", func(ctx context.Context) error {
+			v, err := s.topValues(ctx, "src_ip", "idx_logs_ts_src", 10, extraWhere, extraArgs)
+			if err != nil {
+				return err
+			}
+			out.TopSrcIP = v
+			return nil
+		})
 
 		// Recent records within the window (last 10) — deep-dive only.
 		if full {
-			recentRows, err := s.rdb.QueryContext(ctx,
-				"SELECT "+logCols+" FROM logs"+extraWhere+
-					" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
-			if err != nil {
-				return nil, err
-			}
-			out.Recent = make([]Entry, 0, 10)
-			for recentRows.Next() {
-				e, err := scanEntry(recentRows.Scan)
+			run("recent", func(ctx context.Context) error {
+				recentRows, err := s.rdb.QueryContext(ctx,
+					"SELECT "+logCols+" FROM logs"+extraWhere+
+						" ORDER BY ts DESC, id DESC LIMIT 10", extraArgs...)
 				if err != nil {
-					recentRows.Close()
-					return nil, err
+					return err
 				}
-				out.Recent = append(out.Recent, e)
-			}
-			recentRows.Close()
-			if err := recentRows.Err(); err != nil {
-				return nil, err
-			}
+				defer recentRows.Close()
+				out.Recent = make([]Entry, 0, 10)
+				for recentRows.Next() {
+					e, err := scanEntry(recentRows.Scan)
+					if err != nil {
+						return err
+					}
+					out.Recent = append(out.Recent, e)
+				}
+				return recentRows.Err()
+			})
 		}
 	}
 
+	wg.Wait()
+	if fail != nil {
+		return nil, fail
+	}
 	return out, nil
 }
 
