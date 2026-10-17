@@ -1311,33 +1311,48 @@ func TestRollupRetentionPrunesAggregates(t *testing.T) {
 	}
 }
 
-// TestSplitRollupWindow locks the boundary arithmetic. The parts must never
+// TestClipRollupWindow locks the boundary arithmetic. The parts must never
 // overlap and must tile the requested window exactly whether the edges land on
-// an hour boundary or mid-hour: an off-by-one here would shift rows between the
-// rollup and the scan path and silently change the reported totals.
-func TestSplitRollupWindow(t *testing.T) {
+// an hour boundary or mid-hour, and whether or not the trust bounds clip the
+// whole-hour range: an off-by-one here would shift rows between the rollup and
+// the scan path and silently change the reported totals.
+func TestClipRollupWindow(t *testing.T) {
 	h := hourBucket(1700000000)
 	none := [2]int64{0, -1}
+	far := h + 100*3600 // a frontier far enough ahead to clip nothing
 	cases := []struct {
-		name     string
-		from, to int64
-		head     [2]int64
-		full     [2]int64
-		tail     [2]int64
+		name            string
+		from, to        int64
+		floor, frontier int64
+		head            [2]int64
+		full            [2]int64
+		tail            [2]int64
 	}{
-		{"aligned-one-hour", h, h + 3599, none, [2]int64{h, h + 3599}, none},
-		{"aligned-three-hours", h, h + 3*3600 - 1, none, [2]int64{h, h + 3*3600 - 1}, none},
-		{"mid-head-aligned-tail", h + 10, h + 2*3600 - 1,
+		{"aligned-one-hour", h, h + 3599, h, far, none, [2]int64{h, h + 3599}, none},
+		{"aligned-three-hours", h, h + 3*3600 - 1, h, far, none, [2]int64{h, h + 3*3600 - 1}, none},
+		{"mid-head-aligned-tail", h + 10, h + 2*3600 - 1, h, far,
 			[2]int64{h + 10, h + 3599}, [2]int64{h + 3600, h + 2*3600 - 1}, none},
-		{"aligned-head-mid-tail", h, h + 3600 + 10,
+		{"aligned-head-mid-tail", h, h + 3600 + 10, h, far,
 			none, [2]int64{h, h + 3599}, [2]int64{h + 3600, h + 3610}},
-		{"mid-head-mid-tail", h + 617, h + 2*3600 + 1234,
+		{"mid-head-mid-tail", h + 617, h + 2*3600 + 1234, h, far,
 			[2]int64{h + 617, h + 3599}, [2]int64{h + 3600, h + 2*3600 - 1}, [2]int64{h + 7200, h + 8434}},
-		{"inside-one-hour", h + 10, h + 20, [2]int64{h + 10, h + 20}, none, none},
+		// The production shape: a window ending at the newest row. The hours
+		// within an hour of the frontier must fall back to logs instead of
+		// disqualifying the whole window - otherwise every 7d/30d request
+		// ending "now" would silently lose the rollup.
+		{"ending-at-frontier", h, h + 10*3600 + 1234, h, h + 10*3600 + 1234,
+			none, [2]int64{h, h + 9*3600 - 1}, [2]int64{h + 9*3600, h + 10*3600 + 1234}},
+		// A window starting at the oldest bucket: the floor clips its first hour
+		// back onto the logs side.
+		{"floor-clips-head", h, h + 3*3600 - 1, h + 3600, far,
+			[2]int64{h, h + 3599}, [2]int64{h + 3600, h + 3*3600 - 1}, none},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			w := splitRollupWindow(c.from, c.to)
+			w, ok := clipRollupWindow(c.from, c.to, c.floor, c.frontier)
+			if !ok {
+				t.Fatalf("clip %d-%d (floor %d frontier %d) refused to plan", c.from, c.to, c.floor, c.frontier)
+			}
 			got := [3][2]int64{
 				partSpan(w.hasHead, w.headFrom, w.headTo),
 				partSpan(w.hasFull, w.fullFrom, w.fullTo+3599),
@@ -1345,17 +1360,25 @@ func TestSplitRollupWindow(t *testing.T) {
 			}
 			want := [3][2]int64{c.head, c.full, c.tail}
 			if got != want {
-				t.Fatalf("split %d-%d = head%v full%v tail%v, want head%v full%v tail%v",
+				t.Fatalf("clip %d-%d = head%v full%v tail%v, want head%v full%v tail%v",
 					c.from, c.to, got[0], got[1], got[2], want[0], want[1], want[2])
 			}
 			assertTiles(t, c.from, c.to, got)
 		})
 	}
-	// Degenerate inputs must yield no parts at all rather than a bogus window.
-	for _, c := range [][2]int64{{0, 100}, {100, 0}, {200, 100}} {
-		if w := splitRollupWindow(c[0], c[1]); w.hasHead || w.hasFull || w.hasTail {
-			t.Errorf("split %d-%d should be empty, got %+v", c[0], c[1], w)
+	// A window with no whole hour to give, and degenerate inputs, must be
+	// refused outright rather than planned with bogus parts.
+	for _, c := range [][2]int64{{h + 10, h + 20}, {0, 100}, {100, 0}, {200, 100}} {
+		if w, ok := clipRollupWindow(c[0], c[1], h, far); ok {
+			t.Errorf("clip %d-%d should have been refused, got %+v", c[0], c[1], w)
 		}
+	}
+	// A missing trust bound means no rollup at all.
+	if _, ok := clipRollupWindow(h, h+3*3600-1, 0, far); ok {
+		t.Error("clip with a zero floor should have been refused")
+	}
+	if _, ok := clipRollupWindow(h, h+3*3600-1, h, 0); ok {
+		t.Error("clip with a zero frontier should have been refused")
 	}
 }
 
@@ -1404,6 +1427,10 @@ func TestOfficialStatsRollupMatchesRaw(t *testing.T) {
 		// begin at the oldest folded hour, which retention can only partially
 		// prune (see rollupHourFloor).
 		{"full+tail", h0 + 3600, h0 + 2*3600 + 1234},
+		// Ends at the newest folded row: the hours inside the frontier margin
+		// must be clipped onto the logs side, not reject the whole window. This
+		// is the shape every "last 7d/30d" request has.
+		{"ending-at-frontier", h0 + 617, h0 + 14410},
 	}
 	for _, win := range windows {
 		t.Run(win.name, func(t *testing.T) {
@@ -1420,14 +1447,14 @@ func TestOfficialStatsRollupMatchesRaw(t *testing.T) {
 				t.Fatalf("raw pass warnings: %v", raw.Warnings)
 			}
 			drainRollup(t, s)
-			// Pass 2: only valid if the rollups are provably complete for the
-			// window's whole hours - otherwise this test would prove nothing.
-			rw := splitRollupWindow(win.from, win.to)
-			if !rw.hasFull {
-				t.Fatalf("window %d-%d has no whole hour; test would be vacuous", win.from, win.to)
+			// Pass 2: only valid if some whole hour is provably complete for the
+			// window - otherwise this test would prove nothing.
+			rw, ok, err := s.rollupWindowFor(win.from, win.to)
+			if err != nil {
+				t.Fatalf("plan window %d-%d: %v", win.from, win.to, err)
 			}
-			if ok, err := s.rollupReady(rw); err != nil || !ok {
-				t.Fatalf("rollups not ready for %d-%d: ok=%v err=%v", win.from, win.to, ok, err)
+			if !ok || !rw.hasFull {
+				t.Fatalf("window %d-%d has no whole hour to serve from the rollups; test would be vacuous", win.from, win.to)
 			}
 			agg, err := s.OfficialStats(Counters{}, nil, win.from, win.to, true, true, false)
 			if err != nil {

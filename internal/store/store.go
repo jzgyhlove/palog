@@ -1035,24 +1035,38 @@ type rollupWindow struct {
 // row. One hour is far beyond the ingest's own reordering.
 const rollupFrontierMargin = 3600
 
-// splitRollupWindow divides the inclusive ts window [from,to] into whole hours
-// and the partial hours at each edge. The returned parts never overlap and
-// together cover exactly [from,to].
-func splitRollupWindow(from, to int64) rollupWindow {
-	if from <= 0 || to <= 0 || to < from {
-		return rollupWindow{}
+// clipRollupWindow divides the inclusive ts window [from,to] into the whole
+// hours the rollups can answer and the parts that must still be read from logs,
+// then clips the whole-hour range to the two bounds that make a bucket
+// trustworthy: `floor` is the oldest hour retention cannot have partially
+// pruned, and `frontier` is the ts of the newest folded row, so an hour too
+// close to it could still take a late (backdated) row. Hours clipped off at
+// either end are handed back to the logs side rather than disqualifying the
+// window - a window ending "now" is the common case and must still get its
+// interior hours from the rollups. The returned parts never overlap and
+// together cover exactly [from,to]; ok=false means no whole hour qualifies and
+// the caller should read the whole window from logs.
+func clipRollupWindow(from, to, floor, frontier int64) (rollupWindow, bool) {
+	if from <= 0 || to <= 0 || to < from || floor <= 0 || frontier <= 0 {
+		return rollupWindow{}, false
 	}
 	firstFull := hourBucket(from)
-	lastFull := hourBucket(to)
 	if from > firstFull {
 		firstFull += 3600 // the hour `from` lands in is only partially requested
 	}
+	if firstFull < floor {
+		firstFull = floor
+	}
+	lastFull := hourBucket(to)
 	if to < lastFull+3599 {
 		lastFull -= 3600 // the hour `to` lands in is only partially requested
 	}
+	if safe := hourBucket(frontier - rollupFrontierMargin - 3599); lastFull > safe {
+		lastFull = safe
+	}
 	if firstFull > lastFull {
-		// Fewer than two whole hours are covered: read the window from logs.
-		return rollupWindow{headFrom: from, headTo: to, hasHead: true}
+		// Fewer than two whole hours survived: read the window from logs.
+		return rollupWindow{}, false
 	}
 	w := rollupWindow{fullFrom: firstFull, fullTo: lastFull, hasFull: true}
 	if from < firstFull {
@@ -1061,7 +1075,7 @@ func splitRollupWindow(from, to int64) rollupWindow {
 	if to > lastFull+3599 {
 		w.tailFrom, w.tailTo, w.hasTail = lastFull+3600, to, true
 	}
-	return w
+	return w, true
 }
 
 // rawParts lists the ranges still served from logs (the partial edge hours).
@@ -1114,26 +1128,21 @@ func (s *Store) rollupFrontierTs() (int64, error) {
 	return ts, nil
 }
 
-// rollupReady reports whether every whole hour in w is provably complete in the
-// rollups, so serving them instead of scanning logs cannot change a number.
-func (s *Store) rollupReady(w rollupWindow) (bool, error) {
-	if !w.hasFull {
-		return false, nil
-	}
+// rollupWindowFor builds the read plan for [from,to] and reports whether any
+// whole hour can be served from the rollups. It reads the two trust bounds (see
+// clipRollupWindow) and gives up quietly on any error: the caller then reads the
+// whole window from logs, which is always correct, just slower.
+func (s *Store) rollupWindowFor(from, to int64) (rollupWindow, bool, error) {
 	floor, err := s.rollupHourFloor()
-	if err != nil || floor == 0 || w.fullFrom < floor {
-		return false, err
+	if err != nil || floor == 0 {
+		return rollupWindow{}, false, err
 	}
 	frontier, err := s.rollupFrontierTs()
 	if err != nil || frontier == 0 {
-		return false, err
+		return rollupWindow{}, false, err
 	}
-	// The whole rolled-up range must sit at least one hour behind the newest
-	// folded row, otherwise a backdated row could still move one of its hours.
-	if w.fullTo+3599 > frontier-rollupFrontierMargin {
-		return false, nil
-	}
-	return true, nil
+	w, ok := clipRollupWindow(from, to, floor, frontier)
+	return w, ok, nil
 }
 
 // scoped appends a device-scope predicate to a query that already carries its
@@ -1462,8 +1471,8 @@ func (s *Store) OfficialStats(c Counters, devices []string, from, to int64, full
 	var rw rollupWindow
 	useRollup := false
 	if !cheap && hasWindow && from > 0 && to > 0 {
-		rw = splitRollupWindow(from, to)
-		if ok, err := s.rollupReady(rw); err == nil && ok {
+		if w, ok, err := s.rollupWindowFor(from, to); err == nil && ok {
+			rw = w
 			useRollup = true
 		}
 	}
