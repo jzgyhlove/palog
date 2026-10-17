@@ -75,6 +75,20 @@ function devBadge(name) {
   return '<span class="badge dev">' + esc(name) + '</span>';
 }
 
+/* 设备在线灯:绿 = 最近 DEV_ONLINE_WINDOW 秒内有数据;红 = 无数据(设备可能已掉线);
+ * 灰 = 已禁用(不监听,属正常状态,不用红色误报)。窗口单位为秒,必须与后端
+ * api.deviceOnlineWindow 保持一致。 */
+const DEV_ONLINE_WINDOW = 60;
+function devDot(d) {
+  if (d.online === undefined || d.online === null) return '<span class="faint">-</span>';
+  if (!d.enabled) return '<span class="dev-dot idle" title="设备已禁用，未监听端口"></span>';
+  if (d.online) return '<span class="dev-dot on" title="最近 ' + DEV_ONLINE_WINDOW + ' 秒内有数据"></span>';
+  const ago = d.last_recv
+    ? '；最后数据 ' + Math.max(0, Math.floor(Date.now() / 1000) - d.last_recv) + ' 秒前'
+    : '；本进程启动以来未收到过数据';
+  return '<span class="dev-dot off" title="最近 ' + DEV_ONLINE_WINDOW + ' 秒内无数据，设备可能已掉线' + ago + '"></span>';
+}
+
 /* appid → appname mapping. Authoritative source: web/app_names.json,
  * generated from the official Panabit app dictionary (axp_merge.dic, UTF-16LE).
  * Loaded at startup; fallback to "App <id>" for unmapped ids. */
@@ -848,6 +862,7 @@ async function refreshDevTable() {
       '<tr>' +
       '<td class="faint">' + d.id + '</td>' +
       '<td>' + devBadge(d.name) + '</td>' +
+      '<td>' + devDot(d) + '</td>' +
       '<td class="mono">' + d.port + '</td>' +
       '<td>' + (d.enabled ? '<span class="ok-txt">启用</span>' : '<span class="faint">已禁用</span>') + '</td>' +
       '<td>' +
@@ -1232,6 +1247,7 @@ document.addEventListener('visibilitychange', () => {
     refreshLive();
     if ($('view-dash').classList.contains('active')) refreshDash();
     if ($('view-analysis').classList.contains('active')) refreshAnalysis();
+    if ($('sys-devices').classList.contains('active')) refreshDevTable();
   }
 });
 
@@ -1252,3 +1268,5 @@ loadAppNames();
 // auto refresh: dashboard 10s, live 5s, system view when visible
 setInterval(() => { if (!document.hidden && ME) refreshLive(); }, 5000);
 setInterval(() => { if (!document.hidden && ME && $('view-dash').classList.contains('active')) refreshDash(); }, 10000);
+// 设备管理:每 30 秒刷新一次在线灯(仅在该子页可见时轮询,避免无谓请求)
+setInterval(() => { if (!document.hidden && ME && $('sys-devices').classList.contains('active')) refreshDevTable(); }, 30000);

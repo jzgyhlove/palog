@@ -297,6 +297,16 @@ pre.raw {
 .badge.dev { background: rgba(34,211,238,.08); color: var(--accent); border: 1px solid rgba(34,211,238,.28); font-weight: 500; }
 .ok-txt { color: var(--ok); font-size: 12px; }
 
+/* ---------- 设备在线灯 ---------- */
+/* 绿灯 = 有数据;红灯 = 无数据(掉线);灰灯 = 已禁用。放在「名称」与「端口」之间。 */
+.dev-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--text-faint); vertical-align: middle;
+}
+.dev-dot.on { background: var(--ok); box-shadow: 0 0 7px rgba(63,184,111,.75); }
+.dev-dot.off { background: var(--danger); box-shadow: 0 0 7px rgba(240,82,82,.7); }
+.dev-dot.idle { opacity: .5; }
+
 /* ---------- system subtabs ---------- */
 .subtabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
 .subtabs button {

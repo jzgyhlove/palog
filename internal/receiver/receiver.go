@@ -38,6 +38,11 @@ type Listener struct {
 	Port   int    `json:"port"`
 	Addr   string `json:"addr"`
 	Active bool   `json:"active"`
+	// LastRecv is the unix second of the newest datagram read from this
+	// device, or 0 if none has arrived since the process started. Active only
+	// means "socket is bound"; LastRecv is what tells a device that is still
+	// sending from one that has gone offline.
+	LastRecv int64 `json:"last_recv"`
 }
 
 // Receiver owns the per-device UDP sockets, the parse pipeline and the batch
@@ -59,6 +64,12 @@ type Receiver struct {
 
 // deviceListener is one named UDP socket.
 type deviceListener struct {
+	// lastRecv is the unix second of the newest datagram read on this socket
+	// (0 = none since start). Written by the reader goroutine, read by
+	// Listeners(), so it is only ever touched atomically. Declared first to
+	// keep its 64-bit alignment explicit.
+	lastRecv int64
+
 	dev    store.Device
 	conn   net.PacketConn
 	cancel chan struct{}
@@ -85,7 +96,12 @@ func (r *Receiver) Listeners() []Listener {
 	defer r.mu.Unlock()
 	out := make([]Listener, 0, len(r.listeners))
 	for _, dl := range r.listeners {
-		l := Listener{Device: dl.dev.Name, Port: dl.dev.Port, Active: true}
+		l := Listener{
+			Device:   dl.dev.Name,
+			Port:     dl.dev.Port,
+			Active:   true,
+			LastRecv: atomic.LoadInt64(&dl.lastRecv),
+		}
 		if dl.conn != nil {
 			l.Addr = dl.conn.LocalAddr().String()
 		}
@@ -215,6 +231,9 @@ func (r *Receiver) readLoop(dl *deviceListener) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		// Any datagram — even one that fails to parse below — proves the
+		// device is still sending, so stamp it before parsing.
+		atomic.StoreInt64(&dl.lastRecv, time.Now().Unix())
 		r.handlePacket(dl.dev.Name, buf[:n])
 	}
 }

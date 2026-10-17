@@ -599,20 +599,55 @@ func (s *Server) handleLogByID(w http.ResponseWriter, r *http.Request) {
 
 /* ---------------- device CRUD ---------------- */
 
+// deviceOnlineWindow is how recently a device must have delivered a datagram
+// for the console to still call it online. A full minute tolerates a device
+// that only logs sporadically while still flagging a real outage within a
+// minute. The frontend polls every 30s (see DEV_ONLINE_WINDOW in web/app.js).
+const deviceOnlineWindow = 60 * time.Second
+
+// deviceView is one row of GET /api/devices: store.Device plus the live socket
+// state the console renders as the 在线 indicator. Port, Online and LastRecv
+// are only filled for devices inside the caller's scope, exactly like before —
+// a user must not be able to probe devices they cannot see.
+type deviceView struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Port     int    `json:"port,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	Online   *bool  `json:"online,omitempty"`
+	LastRecv int64  `json:"last_recv,omitempty"`
+}
+
 func (s *Server) handleDevicesGet(w http.ResponseWriter, r *http.Request) {
 	devs, err := s.Store.ListDevices()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Newest datagram per device, from the live listeners. A device with no
+	// listener at all (disabled, or its port failed to bind) never appears
+	// here, so it reads as offline — which is what the operator wants to see.
+	seen := map[string]int64{}
+	for _, l := range s.RX.Listeners() {
+		seen[l.Device] = l.LastRecv
+	}
+	now := time.Now().Unix()
+	window := int64(deviceOnlineWindow / time.Second)
+
 	scope := allowedDevices(userFrom(r))
-	var out []store.Device
+	var out []deviceView
 	for _, d := range devs {
 		if scope != nil && !contains(scope, d.Name) {
-			out = append(out, store.Device{ID: d.ID, Name: d.Name, Enabled: d.Enabled})
-			continue // hide port details of out-of-scope devices
+			// hide port and liveness details of out-of-scope devices
+			out = append(out, deviceView{ID: d.ID, Name: d.Name, Enabled: d.Enabled})
+			continue
 		}
-		out = append(out, d)
+		last := seen[d.Name]
+		online := last > 0 && now-last <= window
+		out = append(out, deviceView{
+			ID: d.ID, Name: d.Name, Port: d.Port, Enabled: d.Enabled,
+			Online: &online, LastRecv: last,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"devices": out})
 }
