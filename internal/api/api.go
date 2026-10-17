@@ -88,8 +88,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config", s.admin(s.handleConfigGet))
 	mux.HandleFunc("PUT /api/config", s.admin(s.handleConfigPut))
 	mux.HandleFunc("POST /api/maintenance/retention", s.admin(s.handleRetention))
-	mux.Handle("/", http.FileServer(http.FS(web.FS)))
+	mux.Handle("/", staticAssets(http.FileServer(http.FS(web.FS))))
 	return logMiddleware(mux)
+}
+
+// staticAssets serves the embedded UI with a revalidation-only cache policy.
+// The embedded files carry no ETag or Last-Modified (embed.FS entries have a
+// zero modtime), so a client that cached a pre-upgrade copy — notably
+// /app_names.json, which the UI fetches from a stable URL — would otherwise
+// keep rendering stale content (e.g. garbled app names repaired in a later
+// binary). no-cache forces revalidation so served assets always match the
+// running binary.
+func staticAssets(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		h.ServeHTTP(w, r)
+	})
 }
 
 /* ---------------- auth middleware ---------------- */

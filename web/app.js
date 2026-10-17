@@ -82,7 +82,11 @@ let APP_NAMES = null; // Map<appid(string), name> or null if not yet loaded
 
 async function loadAppNames() {
   try {
-    const res = await fetch('/app_names.json', { cache: 'force-cache' });
+    // no-store: the dictionary is embedded in the binary behind a stable URL,
+    // so a cached copy would pin stale names (e.g. the garbled pre-repair
+    // entries) in any browser that ever loaded it. Always refetch so repaired
+    // names reach every client.
+    const res = await fetch('/app_names.json', { cache: 'no-store' });
     if (!res.ok) return;
     const obj = await res.json();
     APP_NAMES = new Map(Object.entries(obj));
