@@ -457,6 +457,7 @@ async function refreshLive() {
     const h = await api('/api/health');
     $('live-stats').textContent = h.packets + ' 包 / ' + h.records + ' 记录 / 错 ' + h.parse_errors;
     $('live-dot').classList.toggle('paused', !h.ok);
+    if (h.version && $('brand-ver')) $('brand-ver').textContent = 'Panabit 日志审计 · v' + h.version;
   } catch (e) {
     $('live-stats').textContent = '服务离线';
     $('live-dot').classList.add('paused');
@@ -787,6 +788,7 @@ async function refreshSys() {
       [h.packets, '已收 UDP 包'],
       [h.records, '已存记录'],
       [h.parse_errors, '解析错误'],
+      [h.version || '-', '版本'],
     ];
     $('h-cells').innerHTML = cells.map(([v, l]) =>
       '<div class="cell"><b>' + esc(typeof v === 'string' ? v : fmtNum(v)) + '</b><span>' + esc(l) + '</span></div>').join('');

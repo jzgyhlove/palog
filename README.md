@@ -187,7 +187,7 @@ WantedBy=multi-user.target
 |---|---|---|---|
 | POST | `/api/login` | 公开 | 登录 `{username, password}`;开启验证码时需 `captcha_id`/`captcha_answer`,已绑定 2FA 的账号需 `totp`。返回 `{token, user, tfa_setup_required}` |
 | GET | `/api/captcha` | 公开 | 登录算术验证码 `{enabled, id, question}`(未开启时 `enabled:false`) |
-| GET | `/api/health` | 公开 | 健康与计数 |
+| GET | `/api/health` | 公开 | 健康、版本与计数(含 `version`、`listeners`) |
 | GET | `/api/me` | 登录 | 当前用户信息(含 `tfa_required`/`tfa_enabled`) |
 | PUT | `/api/me/password` | 登录 | 自助改密 `{old_password, new_password}` |
 | POST | `/api/me/tfa/setup` | 登录 | 生成 TOTP 密钥与二维码 `{secret, otpauth, qr}` |
@@ -224,6 +224,8 @@ bash deploy/e2e_check.sh <admin密码>
 
 ```
 .
+├── VERSION                   # 当前发布版本号(内嵌进二进制,见 GET /api/health)
+├── CHANGELOG.md              # 更新日志
 ├── cmd/server/main.go        # 入口:配置、admin 引导、receiver + HTTP、保留清理
 ├── internal/
 │   ├── parse/                # PNB 日志解析(文本行 + 二进制 TLV)、golden 回归测试

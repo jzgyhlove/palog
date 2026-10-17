@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"palog"
 	"palog/internal/receiver"
 	"palog/internal/store"
 	"palog/web"
@@ -341,6 +342,7 @@ func publicUser(u *store.User) map[string]interface{} {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":           true,
+		"version":      palog.Version,
 		"uptime_sec":   int64(time.Since(s.Started).Seconds()),
 		"packets":      s.RX.Packets,
 		"records":      s.RX.Records,
