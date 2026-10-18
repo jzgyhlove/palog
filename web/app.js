@@ -503,7 +503,7 @@ async function renderDrawer(item) {
     ['应用 ID', item.appid >= 0 ? (appNameOf(item.appid) ? appNameOf(item.appid) + ' (' + item.appid + ')' : String(item.appid)) : ''],
     ['域名', item.domain], ['Host', item.host], ['路径', decodePath(item.path)],
     ['方法', item.method], ['用户', item.user],
-    ['流入字节', item.bytes_in], ['流出字节', item.bytes_out],
+    ['流出字节', item.bytes_in], ['流入字节', item.bytes_out],
     ['计数器', item.counters ? JSON.stringify(item.counters) : ''],
     ['标志位', item.flags], ['记录类型', item.rec_type ? '0x' + item.rec_type.toString(16) : ''],
     ['未知 TLV', item.extra && Object.keys(item.extra).length ? JSON.stringify(item.extra) : ''],
@@ -668,8 +668,8 @@ async function refreshDash() {
     }
     $('s-total').textContent = fmtNum(o.traffic.total_records);
     $('s-hour').textContent = fmtNum(o.traffic.last_hour);
-    $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流出</small>';
-    $('ov-tr-down').innerHTML = fmtBytes(o.traffic.bytes_in) + ' <small>流入</small>';
+    $('ov-tr-up').innerHTML = fmtBytes(o.traffic.bytes_in) + ' <small>流出</small>';
+    $('ov-tr-down').innerHTML = fmtBytes(o.traffic.bytes_out) + ' <small>流入</small>';
     $('ov-sec-err').textContent = fmtNum(o.security.parse_errors);
     $('ov-sec-hour').textContent = fmtNum(o.security.last_hour);
   } catch (err) {
