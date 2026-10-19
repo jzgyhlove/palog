@@ -264,3 +264,5 @@ bash deploy/e2e_check.sh <admin密码>
 ## License
 
 MIT(见仓库 LICENSE,如未附带请以仓库为准)。
+
+> 说明:Panabit 是北京派网软件有限公司的品牌/商标,本项目中的引用仅为辅助说明,代码等内容均与官方无关。
